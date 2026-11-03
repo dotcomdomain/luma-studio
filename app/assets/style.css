@@ -118,7 +118,7 @@ button,input,select{line-height:1.35}.slider-row label,.sheet label,.text-option
 .time-range{padding-left:44px;padding-right:44px}.time-range-handle.start{transform:translateX(-100%)}.time-range-handle.end{transform:translateX(0)}.time-range-handle.start span{justify-self:end}.time-range-handle.end span{justify-self:start}
 .time-range-handle:focus-visible{outline:none}.time-range-handle:focus-visible span{outline:2px solid #eff7dc;outline-offset:3px}
 /* Text sizing belongs to the timestamp, never to the trim overlays. */
-.outside-trim{min-width:0}.speed-options{justify-content:space-between;gap:6px;padding-bottom:0}.speed-options .chip{flex:1;padding:11px 7px}.audio-level{gap:12px;min-height:48px}.audio-level output{min-width:48px;font-variant-numeric:tabular-nums}
+.outside-trim{min-width:0}.playback-speed .row-label{font-size:14px;min-width:60px;color:#c0ccba;line-height:1.4}.playback-speed{margin-bottom:6px}.playback-speed .speed-options{flex:1;min-width:0}.playback-note{margin-top:10px}.speed-options{justify-content:space-between;gap:6px;padding-bottom:0}.speed-options .chip{flex:1;padding:11px 7px}.audio-level{gap:12px;min-height:48px}.audio-level output{min-width:48px;font-variant-numeric:tabular-nums}
 
 /* Tool bar: every tool in one row that scrolls sideways; edges fade while more tools are off-screen. */
 .tool-navigation{position:relative;flex-shrink:0;background:#1c251f;border-top:1px solid #354031}

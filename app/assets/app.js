@@ -1024,8 +1024,7 @@ function renderTool() {
   if (tool === 'text') content = textControls();
   if (tool === 'draw') content = penControls();
   if (tool === 'trim') content = trimControls();
-  if (tool === 'speed') content = speedControls();
-  if (tool === 'audio') content = audioControls();
+  if (tool === 'playback') content = playbackControls();
   $('toolContent').innerHTML = content;
   $('toolContent').querySelectorAll(toolScrollers).forEach((e, i) => {
     if (i >= scrolled.length) return;

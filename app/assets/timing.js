@@ -81,12 +81,13 @@ function setFade(key, value) {
   persist();
   draw();
 }
-function speedControls() {
-  return '<div class="chips speed-options">' +
+// Speed and volume share the Playback tab: both change how the clip plays.
+function playbackControls() {
+  return '<div class="slider-row playback-speed" role="group" aria-labelledby="speedLabel"><span class="row-label" id="speedLabel">Speed</span><div class="chips speed-options">' +
       [.5, .75, 1, 1.5, 2]
           .map(v => chip(v + '×', state.speed === v, `setPlaybackSpeed(${v})`))
           .join('') +
-      '</div>';
+      '</div></div>' + audioControls();
 }
 function setPlaybackSpeed(value) {
   commit();
@@ -97,7 +98,7 @@ function setPlaybackSpeed(value) {
 }
 function audioControls() {
   if (!sourceHasAudio)
-    return '<p class="layer-hint">This video has no sound track the phone can play.</p>';
+    return '<p class="layer-hint playback-note">This video has no sound track the phone can play.</p>';
   const level = state.mute ? 0 : Math.round(state.volume * 100);
   return `<div class="slider-row audio-level"><label for="volumeLevel">Volume</label><input id="volumeLevel" aria-label="Volume" type="range" min="0" max="100" step="1" value="${
       level}" onpointerdown="commit()" onkeydown="if(!event.repeat)commit()" oninput="setVolumeLevel(+this.value)"><output id="volumeValue">${
