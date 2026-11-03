@@ -25,8 +25,16 @@ public class MainActivity extends Activity {
       Arrays.asList("image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp", "image/avif");
   WebView web;
   Uri lastExport;
-  volatile boolean cancelled = false, exportBusy = false, publishing = false;
+  volatile boolean cancelled = false, publishing = false;
+  // Per process, not per activity: a rebuilt activity (renderer crash) must not start a
+  // second export or clean up the files of one that is still finishing.
+  static volatile boolean exportBusy = false;
   File photoPart;
+  // The page calls into Java only once it has loaded; files that arrive before that wait.
+  boolean pageReady = false;
+  final List<Intent> waitingIntents = new ArrayList<>();
+  // Imports copied but not yet confirmed by the page; pruning never deletes these.
+  final Set<String> inFlightImports = Collections.synchronizedSet(new HashSet<>());
   // Imports run one at a time, in the order they were requested.
   final ExecutorService importer = Executors.newSingleThreadExecutor();
   // Home-screen thumbnails are made one at a time, off the UI thread.
@@ -38,6 +46,7 @@ public class MainActivity extends Activity {
     photoPart = new File(getCacheDir(), "photo.part");
     migrateRecents();
     pruneSources(null);
+    if (!exportBusy) cleanUpInterruptedExports();
     // A restored activity (process death, or a relaunch from Recents) still carries the
     // intent that first opened it. That file was already imported, so don't import it again.
     final boolean freshIntent = b == null &&
@@ -52,7 +61,12 @@ public class MainActivity extends Activity {
     s.setAllowFileAccess(true);
     s.setAllowFileAccessFromFileURLs(true);
     s.setMediaPlaybackRequiresUserGesture(false);
-    WebView.setWebContentsDebuggingEnabled(true);
+    s.setTextZoom(Math.round(getResources().getConfiguration().fontScale * 100));
+    // DevTools lets anything with adb access script the page and its Java bridge. Test
+    // copies always have it; the real app only while a root-created flag file exists
+    // (scripts/dev.sh makes and removes it).
+    WebView.setWebContentsDebuggingEnabled(!getPackageName().equals("studio.luma.editor") ||
+        new File(getFilesDir(), "devtools").exists());
     web.addJavascriptInterface(new Bridge(), "Native");
     web.setWebViewClient(new WebViewClient() {
       boolean handled = !freshIntent;
@@ -60,9 +74,13 @@ public class MainActivity extends Activity {
         return !u.startsWith("file:");
       }
       public void onPageFinished(WebView v, String u) {
-        if (handled) return;
-        handled = true;
-        handleIncoming(getIntent());
+        pageReady = true;
+        if (!handled) {
+          handled = true;
+          handleIncoming(getIntent());
+        }
+        for (Intent i : waitingIntents) handleIncoming(i);
+        waitingIntents.clear();
       }
       public boolean onRenderProcessGone(WebView v, RenderProcessGoneDetail detail) {
         // The renderer died (usually out of memory on a very large file). Rebuild the page
@@ -74,6 +92,36 @@ public class MainActivity extends Activity {
       }
     });
     web.loadUrl("file:///android_asset/index.html");
+  }
+  @Override
+  public void onConfigurationChanged(android.content.res.Configuration c) {
+    super.onConfigurationChanged(c);
+    // Font size changes are handled here rather than by restarting the activity.
+    if (web != null) web.getSettings().setTextZoom(Math.round(c.fontScale * 100));
+  }
+  // A process that died mid-export leaves its temporary files, and possibly a gallery
+  // entry that was never finished. Neither is ever used again.
+  void cleanUpInterruptedExports() {
+    for (String name : new String[] {"export.mp4", "export-fast.mp4", "export.mp4.aac.tmp", "photo.part"})
+      new File(getCacheDir(), name).delete();
+    new Thread(() -> {
+      for (Uri collection : new Uri[] {MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+               MediaStore.Video.Media.EXTERNAL_CONTENT_URI}) {
+        try {
+          Bundle q = new Bundle();
+          q.putString(ContentResolver.QUERY_ARG_SQL_SELECTION, MediaStore.MediaColumns.IS_PENDING
+              + "=1 AND " + MediaStore.MediaColumns.OWNER_PACKAGE_NAME + "=?");
+          q.putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, new String[] {getPackageName()});
+          if (Build.VERSION.SDK_INT >= 30) q.putInt(MediaStore.QUERY_ARG_MATCH_PENDING, MediaStore.MATCH_ONLY);
+          Uri from = Build.VERSION.SDK_INT >= 30 ? collection : MediaStore.setIncludePending(collection);
+          try (Cursor c = getContentResolver().query(from, new String[] {MediaStore.MediaColumns._ID}, q, null)) {
+            while (c != null && c.moveToNext())
+              getContentResolver().delete(ContentUris.withAppendedId(collection, c.getLong(0)), null, null);
+          }
+        } catch (Exception ignored) {
+        }
+      }
+    }, "luma-cleanup").start();
   }
   @Override
   protected void onDestroy() {
@@ -133,7 +181,7 @@ public class MainActivity extends Activity {
   // Deletes copied sources that no recent project uses. `keep` survives too (a file that
   // is open but whose load hasn't been confirmed yet).
   synchronized void pruneSources(String keep) {
-    Set<String> used = new HashSet<>();
+    Set<String> used = new HashSet<>(inFlightImports);
     if (keep != null) used.add(keep);
     JSONArray list = recents();
     for (int i = 0; i < list.length(); i++) used.add(list.optJSONObject(i).optString("path"));
@@ -201,13 +249,35 @@ public class MainActivity extends Activity {
   }
 
   // ---- Importing -------------------------------------------------------------------
+  // A type like image/* says what kind of file it is but not its format.
+  static boolean vagueType(String type) {
+    return type == null || type.endsWith("/*") || type.equals("application/octet-stream");
+  }
+  // Another app may point Edit at a file:// path inside Luma's own data. Only the files
+  // folder (where Luma keeps its imports, and tests place their media) may be read.
+  boolean privateFile(Uri uri) {
+    if (!"file".equals(uri.getScheme()) || uri.getPath() == null) return false;
+    try {
+      File f = new File(uri.getPath()).getCanonicalFile();
+      String data = getDataDir().getCanonicalPath() + File.separator;
+      String files = getFilesDir().getCanonicalPath() + File.separator;
+      String path = f.getPath();
+      String user0 = "/data/user/0/" + getPackageName() + File.separator;
+      boolean inside = path.startsWith(data) || path.startsWith(user0) ||
+          path.startsWith("/data/data/" + getPackageName() + File.separator);
+      return inside && !(f.getParentFile() != null &&
+          (f.getParentFile().getCanonicalPath() + File.separator).equals(files));
+    } catch (IOException e) {
+      return true;
+    }
+  }
   void importUri(Uri uri, String fallbackType, boolean external) {
     importer.execute(() -> {
       File dest = null;
       try {
+        if (privateFile(uri)) throw new IOException("Private file");
         String type = getContentResolver().getType(uri);
-        if (type == null || type.equals("application/octet-stream") || type.equals("*/*"))
-          type = fallbackType;
+        if (vagueType(type)) type = vagueType(fallbackType) ? null : fallbackType;
         String name = "Untitled";
         long size = -1;
         try (Cursor c = getContentResolver().query(uri, null, null, null, null)) {
@@ -224,6 +294,8 @@ public class MainActivity extends Activity {
         js("importStarted(" + JSONObject.quote(name) + ")");
         File raw = new File(getFilesDir(), "source-" + System.currentTimeMillis() + ".part");
         dest = raw;
+        if (size > 0 && size > getFilesDir().getUsableSpace() - FREE_SPACE_RESERVE)
+          throw new NoSpaceException();
         copy(uri, raw, size);
         if (type == null || !(type.startsWith("image/") || type.startsWith("video/")))
           type = sniffType(raw, name);
@@ -243,17 +315,26 @@ public class MainActivity extends Activity {
         if (!finalFile.equals(raw) && raw.exists() && !raw.renameTo(finalFile))
           throw new IOException("Could not store the file");
         dest = finalFile;
+        inFlightImports.add(finalFile.toString());
         js("openImported(" + JSONObject.quote("file://" + finalFile) + "," +
             JSONObject.quote(video ? "video" : "photo") + "," + JSONObject.quote(name) + "," +
             external + ")");
       } catch (Throwable e) {
-        if (dest != null) dest.delete();
+        if (dest != null) {
+          inFlightImports.remove(dest.toString());
+          dest.delete();
+        }
         js("importFailed(" + JSONObject.quote(
             e instanceof OutOfMemoryError ? "This file is too large to open." :
+            e instanceof NoSpaceException ? "There isn't enough free storage to open this file." :
             "Could not open this file. Try another photo or video.") + ")");
       }
     });
   }
+  // Imports stop while this much storage is still free, so a huge or endless stream can't
+  // fill the phone.
+  static final long FREE_SPACE_RESERVE = 512L << 20;
+  static final class NoSpaceException extends IOException {}
   void copy(Uri uri, File dest, long size) throws IOException {
     try (InputStream in = getContentResolver().openInputStream(uri);
         OutputStream out = new FileOutputStream(dest)) {
@@ -261,9 +342,14 @@ public class MainActivity extends Activity {
       byte[] buf = new byte[1 << 20];
       long done = 0, reported = 0;
       int n;
+      long checked = 0;
       while ((n = in.read(buf)) != -1) {
         out.write(buf, 0, n);
         done += n;
+        if (done - checked > (64 << 20)) {
+          checked = done;
+          if (dest.getParentFile().getUsableSpace() < FREE_SPACE_RESERVE) throw new NoSpaceException();
+        }
         // Large files report progress about every 4%.
         if (size > (8 << 20) && done - reported > size / 25) {
           reported = done;
@@ -308,6 +394,12 @@ public class MainActivity extends Activity {
   @Override
   protected void onNewIntent(Intent intent) {
     super.onNewIntent(intent);
+    if (!pageReady) {
+      // The page can't take the file yet. The intent that started the activity is still
+      // handled in onPageFinished, so it isn't replaced.
+      waitingIntents.add(intent);
+      return;
+    }
     setIntent(intent);
     handleIncoming(intent);
   }
@@ -334,10 +426,19 @@ public class MainActivity extends Activity {
   }
 
   // ---- Saving ----------------------------------------------------------------------
-  String quote(String s) {
-    return "'" + s.replace("'", "'\\''") + "'";
+  interface Writer {
+    void write(OutputStream out) throws IOException;
   }
   Uri publish(File f, String mime, String requestedName) throws Exception {
+    return publish(out -> {
+      try (InputStream in = new FileInputStream(f)) {
+        byte[] b = new byte[1 << 20];
+        int n;
+        while ((n = in.read(b)) != -1) out.write(b, 0, n);
+      }
+    }, mime, requestedName);
+  }
+  Uri publish(Writer writer, String mime, String requestedName) throws Exception {
     boolean video = mime.startsWith("video");
     ContentValues v = new ContentValues();
     String extension = video ? ".mp4" : mime.equals("image/png") ? ".png" :
@@ -358,12 +459,11 @@ public class MainActivity extends Activity {
                                                 : MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
         v);
     if (uri == null) throw new IOException("The gallery did not accept the file. Check free storage.");
-    try (InputStream in = new FileInputStream(f);
-        OutputStream out = getContentResolver().openOutputStream(uri)) {
+    try (OutputStream out = getContentResolver().openOutputStream(uri)) {
       if (out == null) throw new IOException("The gallery did not accept the file.");
-      byte[] b = new byte[1 << 20];
-      int n;
-      while ((n = in.read(b)) != -1) out.write(b, 0, n);
+      BufferedOutputStream buffered = new BufferedOutputStream(out, 1 << 20);
+      writer.write(buffered);
+      buffered.flush();
       v.clear();
       v.put(MediaStore.MediaColumns.IS_PENDING, 0);
       getContentResolver().update(uri, v, null, null);
@@ -413,6 +513,7 @@ public class MainActivity extends Activity {
       File f = ownedFile(path);
       if (f == null || f.getName().equals("demo.mp4")) return;
       rememberProject(f.toString(), name, "video".equals(type) ? "video" : "photo");
+      inFlightImports.remove(f.toString());
     }
     @JavascriptInterface
     public void requestThumbnail(String path) {
@@ -430,10 +531,20 @@ public class MainActivity extends Activity {
     public void forgetFile(String path) {
       File f = ownedFile(path);
       if (f == null) return;
+      inFlightImports.remove(f.toString());
       JSONArray list = recents();
       for (int i = 0; i < list.length(); i++)
         if (f.toString().equals(list.optJSONObject(i).optString("path"))) return;
       f.delete();
+    }
+    // The screen stays on while something is being saved; a screen timeout would
+    // otherwise stop the app in the middle of a long export.
+    @JavascriptInterface
+    public void keepScreenOn(boolean on) {
+      runOnUiThread(() -> {
+        if (on) getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        else getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+      });
     }
     @JavascriptInterface
     public void exit() {
@@ -555,26 +666,32 @@ public class MainActivity extends Activity {
       exportBusy = true;
       cancelled = false;
       publishing = false;
+      // A foreground service keeps the process running (and the CPU awake) if the person
+      // switches apps or the screen goes off during the export.
+      ExportService.start(MainActivity.this);
       new Thread(() -> {
-        File out = new File(getCacheDir(), "export.mp4"),
-             fast = new File(getCacheDir(), "export-fast.mp4");
+        File out = new File(getCacheDir(), "export.mp4");
         boolean done = false;
         try {
           VideoExporter job = videoJob(new JSONObject(json), out);
           job.run();
           if (cancelled) return;
-          File result = out;
-          if (job.fastStart) {
-            js("exportFinalizing()");
-            if (Mp4FastStart.process(out, fast)) result = fast;
-          }
           publishing = true;
           js("exportFinalizing()");
-          publish(result, "video/mp4", job.name);
+          // Streaming optimization reorders the file on its way into the gallery. If the
+          // file can't be reordered it is saved as it is; it still plays everywhere.
+          Mp4FastStart.Plan plan = null;
+          if (job.fastStart) try { plan = Mp4FastStart.plan(out); } catch (Exception ignored) {}
+          final Mp4FastStart.Plan fast = plan;
+          if (fast != null) publish(o -> Mp4FastStart.write(out, fast, o), "video/mp4", job.name);
+          else publish(out, "video/mp4", job.name);
           done = true;
-          js(job.shortBy == null ? "exportDone()" : "exportDone(" + JSONObject.quote(
-              "The source file ended early, so only its first " + job.shortBy
-              + " s could be saved.") + ")");
+          List<String> notes = new ArrayList<>();
+          if (job.shortBy != null)
+            notes.add("The source file ended early, so only its first " + job.shortBy + " s could be saved.");
+          if (job.audioNote != null) notes.add(job.audioNote);
+          if (job.colorNote != null) notes.add(job.colorNote);
+          js(notes.isEmpty() ? "exportDone()" : "exportDone(" + JSONObject.quote(String.join("\n", notes)) + ")");
         } catch (VideoExporter.CancelledException e) {
           // reported in finally
         } catch (Throwable e) {
@@ -582,13 +699,13 @@ public class MainActivity extends Activity {
             fail("Video export failed. " + friendly(e.getMessage()));
         } finally {
           out.delete();
-          fast.delete();
           exportBusy = false;
+          ExportService.stop(MainActivity.this);
           if (cancelled && !done && !publishing)
             js("exportCancelled()");
           publishing = false;
         }
-      }).start();
+      }, "luma-export").start();
     }
   }
   // Builds the export job from the page's settings and checks every value.
@@ -661,6 +778,7 @@ public class MainActivity extends Activity {
         if (percent == last) return;
         last = percent;
         js("exportProgress(" + percent + ")");
+        ExportService.progress(MainActivity.this, percent);
       }
       public boolean cancelled() { return cancelled; }
     };
@@ -684,16 +802,51 @@ public class MainActivity extends Activity {
     if (base64.isEmpty()) return;
     byte[] png = android.util.Base64.decode(base64, 0);
     VideoExporter.Overlay o = new VideoExporter.Overlay();
-    o.bitmap = BitmapFactory.decodeByteArray(png, 0, png.length);
-    if (o.bitmap == null) throw new IOException("An overlay image could not be read.");
-    if (o.bitmap.getWidth() != job.width || o.bitmap.getHeight() != job.height) {
-      Bitmap scaled = Bitmap.createScaledBitmap(o.bitmap, job.width, job.height, true);
-      o.bitmap.recycle();
-      o.bitmap = scaled;
+    Bitmap full = BitmapFactory.decodeByteArray(png, 0, png.length);
+    if (full == null) throw new IOException("An overlay image could not be read.");
+    if (full.getWidth() != job.width || full.getHeight() != job.height) {
+      Bitmap scaled = Bitmap.createScaledBitmap(full, job.width, job.height, true);
+      full.recycle();
+      full = scaled;
+    }
+    // Only the rectangle that has pixels is kept and blended on each frame; text or a
+    // small drawing covers a fraction of a 4K frame.
+    int[] box = opaqueBounds(full);
+    if (box == null) {
+      full.recycle();
+      return;
+    }
+    o.x = box[0];
+    o.y = box[1];
+    o.w = box[2] - box[0];
+    o.h = box[3] - box[1];
+    if (o.w == full.getWidth() && o.h == full.getHeight()) o.bitmap = full;
+    else {
+      o.bitmap = Bitmap.createBitmap(full, o.x, o.y, o.w, o.h);
+      full.recycle();
     }
     o.fromUs = fromUs;
     o.toUs = toUs;
     job.overlays.add(o);
+  }
+  // left, top, right, bottom of the pixels with any alpha, with a 1 px margin for filtering;
+  // null for a fully transparent bitmap.
+  static int[] opaqueBounds(Bitmap b) {
+    int w = b.getWidth(), h = b.getHeight(), left = w, top = h, right = -1, bottom = -1;
+    int[] row = new int[w];
+    for (int y = 0; y < h; y++) {
+      b.getPixels(row, 0, w, 0, y, w, 1);
+      int first = -1, last = -1;
+      for (int x = 0; x < w; x++)
+        if ((row[x] >>> 24) != 0) { if (first < 0) first = x; last = x; }
+      if (first < 0) continue;
+      if (top > y) top = y;
+      bottom = y;
+      left = Math.min(left, first);
+      right = Math.max(right, last);
+    }
+    if (right < 0) return null;
+    return new int[] {Math.max(0, left - 1), Math.max(0, top - 1), Math.min(w, right + 2), Math.min(h, bottom + 2)};
   }
   @Override
   public void onBackPressed() {

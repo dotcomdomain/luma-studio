@@ -133,17 +133,29 @@ final class AudioPipeline {
             // Frames before the trim start are dropped; so is anything after its end.
             long first = Math.round((info.presentationTimeUs - startUs) * inRate / 1e6);
             int skip = (int) Math.max(0, Math.min(frames, -first));
+            stage.clear();
+            // A gap in the audio (it starts after the video, or the file skips) becomes
+            // silence, so everything after it stays in sync with the picture. Timestamps a
+            // few milliseconds off are normal rounding and left alone.
+            long gap = first - inputFrames;
+            if (gap > inRate / 50 && inputFrames < inputLimit) {
+              int silence = (int) Math.min(gap, inputLimit - inputFrames);
+              stage.zeros(silence, outChannels);
+              inputFrames += silence;
+            } else if (-gap > inRate / 50 && first >= 0) {
+              // Overlapping timestamps: drop what was already played.
+              skip = (int) Math.max(skip, Math.min(frames, -gap));
+            }
             int take = (int) Math.max(0, Math.min(frames - skip, inputLimit - inputFrames));
             if (take > 0) {
-              stage.clear();
               stage.reserve(take, outChannels);
               for (int f = skip; f < skip + take; f++) {
                 int at = info.offset + f * bytesPerFrame;
                 mix(pcm, at, floatPcm, inChannels, outChannels, volume, stage);
               }
               inputFrames += take;
-              process(stage, stretch, resampler, processed, resampled);
             }
+            if (stage.frames > 0) process(stage, stretch, resampler, processed, resampled);
             decoder.releaseOutputBuffer(d, false);
             if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0 ||
                 (inputLimit > 0 && inputFrames >= inputLimit)) {
@@ -238,18 +250,33 @@ final class AudioPipeline {
   }
 
   // One input frame, converted to the output channel layout with volume applied.
+  // Surround sources (decoders output FL FR FC LFE BL BR [SL SR]) fold the centre and
+  // surround channels into left and right at -3 dB, the usual stereo downmix; LFE is left
+  // out. The sum is scaled so a full-level centre channel doesn't clip.
+  static final float MINUS_3DB = .7071f;
   static void mix(ByteBuffer pcm, int at, boolean floatPcm, int inCh, int outCh, float volume,
       FloatList out) {
     float l = sample(pcm, at, 0, floatPcm), r = inCh > 1 ? sample(pcm, at, 1, floatPcm) : l;
+    if (inCh >= 3) {
+      // Quad has no centre; 5.0 has no LFE.
+      boolean centre = inCh != 4;
+      int surround = inCh == 4 ? 2 : inCh == 5 ? 3 : 4;
+      if (centre) {
+        float c = sample(pcm, at, 2, floatPcm) * MINUS_3DB;
+        l += c;
+        r += c;
+      }
+      for (int ch = surround; ch + 1 < Math.min(inCh, 8); ch += 2) {
+        l += sample(pcm, at, ch, floatPcm) * MINUS_3DB;
+        r += sample(pcm, at, ch + 1, floatPcm) * MINUS_3DB;
+      }
+      l /= 1 + MINUS_3DB;
+      r /= 1 + MINUS_3DB;
+    }
     if (outCh == 1) {
-      float sum = 0;
-      for (int c = 0; c < inCh; c++) sum += sample(pcm, at, c, floatPcm);
-      out.add1(sum / inCh * volume);
-    } else if (outCh == 2) {
-      out.add2(l * volume, r * volume);
+      out.add1((l + r) * .5f * volume);
     } else {
-      for (int c = 0; c < outCh; c++)
-        out.add1((c < inCh ? sample(pcm, at, c, floatPcm) : 0) * volume);
+      out.add2(l * volume, r * volume);
     }
   }
   static float sample(ByteBuffer pcm, int at, int channel, boolean floatPcm) {
