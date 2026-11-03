@@ -9,7 +9,7 @@ let state, history = [], future = [], mediaType = 'photo', mediaPath = '',
            nativeW = 0, nativeH = 0, drawPending = false;
 // sessionExternal: this project came from another app's Edit or Share, so Back from the
 // editor returns there. pendingImport: a file that arrived while an export was running.
-let sessionExternal = false, pendingImport = null;
+let sessionExternal = false, pendingImport = null, sourceHasAudio = true;
 const canvas = $('canvas'), ctx = canvas.getContext('2d'), video = $('video');
 // Photos larger than this get a downscaled copy for the on-screen preview; exports still
 // read the full-resolution image.
@@ -17,11 +17,15 @@ const PREVIEW_EDGE = 2048;
 let previewImage = null;
 const defaults = () => ({
   look: 'Original',
+  lookStrength: 100,
   brightness: 0,
   contrast: 0,
   saturation: 0,
   warmth: 0,
+  shadows: 0,
+  highlights: 0,
   vignette: 0,
+  straighten: 0,
   ratio: 0,
   crop: null,
   annotationSpace: 2,
@@ -46,7 +50,9 @@ const defaults = () => ({
   end: 0,
   speed: 1,
   volume: 1,
-  mute: false
+  mute: false,
+  fadeIn: 0,
+  fadeOut: 0
 });
 const looks = [
   ['Original', 0, 0, 0, 0], ['Golden', 4, 8, 12, 24],
@@ -126,6 +132,8 @@ function loadMedia(path, type, name, resume = false, external = false) {
   const sequence = ++mediaLoadSequence;
   cancelPhotoTransparencyProbe();
   sourceVideoFps = 0;
+  videoColorCorrection = null;
+  referenceRequest = null;
   photoHasTransparency = type === 'photo' ? null : false;
   photoTransparencyTask = Promise.resolve(false);
   nativeW = nativeH = 0;
@@ -220,7 +228,8 @@ function loadMedia(path, type, name, resume = false, external = false) {
       try {
         const info = JSON.parse(Native.videoInfo(path));
         sourceVideoFps = Number.isFinite(info.fps) && info.fps > 0 ? info.fps : 0;
-      } catch (_) { sourceVideoFps = 0; }
+        sourceHasAudio = !!info.audio;
+      } catch (_) { sourceVideoFps = 0; sourceHasAudio = true; }
       if (!state.end || state.end > duration) state.end = duration;
       $('scrub').max = duration;
       video.currentTime = state.start;
@@ -475,14 +484,32 @@ function resetEdit() {
   afterHistory();
   if (editsJSON(state) !== before) toast('All edits removed. Undo brings them back');
 }
+// A look adds its offsets to the sliders, scaled by its strength.
 function params(s) {
-  const l = looks.find(l => l[0] === s.look) || looks[0];
+  const l = looks.find(l => l[0] === s.look) || looks[0],
+        k = (s.lookStrength ?? 100) / 100;
   return {
-    b: Math.max(-100, Math.min(100, s.brightness + l[1])),
-        c: Math.max(-90, Math.min(100, s.contrast + l[2])),
-        sat: Math.max(-100, Math.min(100, s.saturation + l[3])),
-        warm: Math.max(-100, Math.min(100, s.warmth + l[4]))
+    b: Math.max(-100, Math.min(100, s.brightness + l[1] * k)),
+        c: Math.max(-90, Math.min(100, s.contrast + l[2] * k)),
+        sat: Math.max(-100, Math.min(100, s.saturation + l[3] * k)),
+        warm: Math.max(-100, Math.min(100, s.warmth + l[4] * k))
   }
+}
+// Shadows and highlights bend the tone curve: shadows move the darker third of the range
+// (peak effect at 1/3 brightness), highlights the brighter third (peak at 2/3). The curve
+// is a 33-point table, used as an SVG feComponentTransfer in the preview and as a lookup
+// texture in the video exporter, so both apply exactly the same curve. Null when flat.
+function toneTable(s) {
+  const sh = (s.shadows || 0) / 100, hi = (s.highlights || 0) / 100;
+  if (!sh && !hi) return null;
+  const table = [];
+  let last = 0;
+  for (let i = 0; i <= 32; i++) {
+    const x = i / 32, ws = x * (1 - x) ** 2 * 6.75, wh = x * x * (1 - x) * 6.75;
+    last = Math.max(last, clamp(x + .18 * (sh * ws + hi * wh), 0, 1));
+    table.push(Math.round(last * 1e4) / 1e4);
+  }
+  return table;
 }
 // Warmth shifts white balance: warm raises red and lowers blue, cool does the reverse.
 // The same channel gains drive the preview (an SVG color matrix) and the video export.
@@ -490,25 +517,117 @@ function warmthGains(warm) {
   const k = warm / 100;
   return [1 + .16 * k, 1 + .03 * k, 1 - .2 * k];
 }
-function warmthFilter(warm) {
-  const w = Math.round(warm), id = 'warmth' + (w < 0 ? 'm' : 'p') + Math.abs(w);
+// One SVG filter per combination of warmth and tone curve in use. Only the most recent
+// ones are kept, so dragging sliders doesn't pile up filter elements.
+const svgFilterIds = [];
+function svgFilter(warm, tone, correction = null) {
+  const w = Math.round(warm), id = 'f' + (correction ? correction.id : '') + w +
+      (tone ? 't' + tone.join('_').replace(/\./g, '') : '');
   if (!document.getElementById(id)) {
-    const [r, g, b] = warmthGains(w);
+    const [r, g, b] = warmthGains(w), values = tone?.join(' ');
     $('filterDefs').insertAdjacentHTML('beforeend',
-        `<filter id="${id}" color-interpolation-filters="sRGB"><feColorMatrix type="matrix" values="${
-            r} 0 0 0 0 0 ${g} 0 0 0 0 0 ${b} 0 0 0 0 0 1 0"/></filter>`);
+        `<filter id="${id}" color-interpolation-filters="sRGB">${correction ?
+            `<feColorMatrix type="matrix" values="${correction.values}"/>` : ''}${w ? `<feColorMatrix type="matrix" values="${
+            r} 0 0 0 0 0 ${g} 0 0 0 0 0 ${b} 0 0 0 0 0 1 0"/>` : ''}${tone ?
+            `<feComponentTransfer><feFuncR type="table" tableValues="${values}"/><feFuncG type="table" tableValues="${
+            values}"/><feFuncB type="table" tableValues="${values}"/></feComponentTransfer>` : ''}</filter>`);
+    svgFilterIds.push(id);
+    while (svgFilterIds.length > 48) document.getElementById(svgFilterIds.shift())?.remove();
   }
   return `url(#${id})`;
 }
 // Warmth comes first: Chromium's canvas filter draws nothing when a url() filter follows
 // CSS filter functions. The video export applies the same order.
-function cssFilter(s) {
-  let p = params(s);
-  const f = (Math.round(p.warm) ? warmthFilter(p.warm) + ' ' : '') +
+// correction: the preview's fix for the WebView's video color conversion (see
+// videoReferenceFrame), applied before everything else.
+function cssFilter(s, correction = null) {
+  let p = params(s), tone = toneTable(s);
+  const f = (Math.round(p.warm) || tone || correction ? svgFilter(p.warm, tone, correction) + ' ' : '') +
       (p.b ? `brightness(${1 + p.b / 100}) ` : '') + (p.c ? `contrast(${1 + p.c / 100}) ` : '') +
       (p.sat ? `saturate(${1 + p.sat / 100})` : '');
   // An unedited picture skips the filter pass entirely.
   return f.trim() || 'none';
+}
+// The WebView doesn't always convert video colors the way the file is tagged: on this
+// phone a BT.709 video sometimes gets the BT.601 matrix, depending on what was played
+// before. The export converts exactly, so the preview could look different from it. When
+// a video opens, Java decodes the frame on screen into a small reference picture with the
+// exporter's conversion; if the WebView's picture of that frame differs, the color matrix
+// that maps one to the other corrects the preview (and saved frames) for this video.
+let videoColorCorrection = null, referenceRequest = null, colorCorrections = 0;
+function requestVideoReference() {
+  if (mediaType !== 'video' || !isOwnedVideo(mediaPath) || referenceRequest?.path === mediaPath) return;
+  referenceRequest = {path: mediaPath, t: video.currentTime};
+  Native.videoReference?.(mediaPath, video.currentTime);
+}
+const isOwnedVideo = path => /\/files\/[^/]+$/.test(path);
+// Solves A x = b (4 × 4) by Gaussian elimination.
+function solve4(A, b) {
+  const m = A.map((row, i) => [...row, b[i]]);
+  for (let c = 0; c < 4; c++) {
+    let p = c;
+    for (let r = c + 1; r < 4; r++) if (Math.abs(m[r][c]) > Math.abs(m[p][c])) p = r;
+    [m[c], m[p]] = [m[p], m[c]];
+    if (Math.abs(m[c][c]) < 1e-12) return null;
+    for (let r = 0; r < 4; r++) {
+      if (r === c) continue;
+      const f = m[r][c] / m[c][c];
+      for (let k = c; k < 5; k++) m[r][k] -= f * m[c][k];
+    }
+  }
+  return m.map((row, i) => row[4] / row[i]);
+}
+function videoReferenceFrame(path, t, ref) {
+  if (!ref || path !== mediaPath || mediaType !== 'video' || video.seeking ||
+      Math.abs(video.currentTime - t) > .001) return;
+  // Each cell is the mean of 8 × 8 samples, as Java takes them.
+  const c = document.createElement('canvas');
+  c.width = ref.w * 8;
+  c.height = ref.h * 8;
+  const g = c.getContext('2d', {willReadFrequently: true});
+  g.drawImage(video, 0, 0, c.width, c.height);
+  const px = g.getImageData(0, 0, c.width, c.height).data, X = [], Y = [];
+  c.width = c.height = 0;
+  for (let i = 0, n = ref.w * ref.h; i < n; i++) {
+    const cx = i % ref.w, cy = Math.floor(i / ref.w), m = [0, 0, 0];
+    for (let j = 0; j < 8; j++)
+      for (let k = 0; k < 8; k++) {
+        const o = ((cy * 8 + j) * ref.w * 8 + cx * 8 + k) * 4;
+        m[0] += px[o]; m[1] += px[o + 1]; m[2] += px[o + 2];
+      }
+    for (let k = 0; k < 3; k++) m[k] /= 64;
+    const e = ref.rgb.slice(i * 3, i * 3 + 3);
+    // Clipped samples don't say how the conversion works.
+    if ([...m, ...e].some(v => v < 3 || v > 252)) continue;
+    X.push([m[0] / 255, m[1] / 255, m[2] / 255, 1]);
+    Y.push(e.map(v => v / 255));
+  }
+  if (X.length < 40) return;
+  // Least squares, pulled gently towards "no correction" so a frame with little color
+  // can't produce a wild matrix.
+  const lambda = X.length * .002, rows = [0, 1, 2].map(ch => {
+    const A = [0, 1, 2, 3].map(r => [0, 1, 2, 3].map(k => X.reduce((s, x) => s + x[r] * x[k], 0) + (r === k ? lambda : 0)));
+    const b = [0, 1, 2, 3].map(r => X.reduce((s, x, i) => s + x[r] * Y[i][ch], 0) + (r === ch ? lambda : 0));
+    return solve4(A, b);
+  });
+  if (rows.some(r => !r)) return;
+  let before = 0, after = 0;
+  X.forEach((x, i) => {
+    for (let ch = 0; ch < 3; ch++) {
+      before += Math.abs(x[ch] - Y[i][ch]);
+      after += Math.abs(rows[ch].reduce((s, w, k) => s + w * x[k], 0) - Y[i][ch]);
+    }
+  });
+  before *= 255 / (X.length * 3);
+  after *= 255 / (X.length * 3);
+  window.videoColorCheck = {before: +before.toFixed(2), after: +after.toFixed(2), samples: X.length};
+  if (before < 2 || after > before * .6) return;
+  videoColorCorrection = {id: 'v' + (++colorCorrections), values:
+      rows.map(r => [r[0], r[1], r[2], 0, r[3]].map(v => v.toFixed(5)).join(' ')).join(' ') + ' 0 0 0 1 0'};
+  window.videoColorCheck.corrected = true;
+  lookFrame = {key: '', url: ''};
+  draw();
+  if (tool === 'looks') renderTool();
 }
 function geometry(s) {
   let w = nativeW, h = nativeH;
@@ -540,7 +659,7 @@ function renderTo(target, max, original = false, viewState = state, background =
       previewImage && (fullImageReleased || previewCopyEnough(max, s)) ? previewImage : image;
   const cacheable = target === canvas && !background &&
       (mediaType === 'photo' || (video.paused && !video.seeking));
-  const key = cacheable ? [mediaPath, tw, th, s.rotation, s.flip, s.flipY, g.x, g.y, g.cw, g.ch,
+  const key = cacheable ? [mediaPath, tw, th, s.rotation, s.straighten, s.flip, s.flipY, g.x, g.y, g.cw, g.ch,
     cssFilter(s), source === previewImage, mediaType === 'photo' ? 0 : video.currentTime].join('|') : '';
   if (cacheable && key === previewBase.key) {
     c.drawImage(previewBase.canvas, 0, 0);
@@ -555,9 +674,14 @@ function renderTo(target, max, original = false, viewState = state, background =
     b.save();
     b.translate((g.w / 2 - g.x) * scale, (g.h / 2 - g.y) * scale);
     b.scale(scale, scale);
+    if (s.straighten) {
+      const k = straightenScale(s);
+      b.rotate(s.straighten * Math.PI / 180);
+      b.scale(k, k);
+    }
     b.rotate(s.rotation * Math.PI / 180);
     b.scale(s.flip ? -1 : 1, s.flipY ? -1 : 1);
-    b.filter = cssFilter(s);
+    b.filter = cssFilter(s, source === video ? videoColorCorrection : null);
     b.imageSmoothingQuality = 'high';
     try {
       b.drawImage(source, -nativeW / 2, -nativeH / 2, nativeW, nativeH)
@@ -571,6 +695,28 @@ function renderTo(target, max, original = false, viewState = state, background =
     }
   }
   paintAnnotations(c, s);
+  // Fades only show in the preview; a saved frame or photo has none.
+  if (target === canvas && mediaType === 'video' && !original && (s.fadeIn || s.fadeOut)) {
+    const shown = fadeGain(s, video.currentTime);
+    if (shown < 1) {
+      c.fillStyle = `rgba(0,0,0,${1 - shown})`;
+      c.fillRect(0, 0, tw, th);
+    }
+  }
+}
+// The zoom that keeps a straightened picture covering its whole frame.
+function straightenScale(s) {
+  const a = Math.abs(s.straighten || 0) * Math.PI / 180, g = geometry({...s, crop: null});
+  return Math.cos(a) + Math.max(g.w / g.h, g.h / g.w) * Math.sin(a);
+}
+// How much of the picture and sound shows at a source time, 0 (black) to 1. The video
+// exporter's fadeGain uses the same formula in output time.
+function fadeGain(s, t) {
+  const out = (t - s.start) / s.speed, end = (s.end - s.start) / s.speed;
+  let g = 1;
+  if (s.fadeIn) g = Math.min(g, out / s.fadeIn);
+  if (s.fadeOut) g = Math.min(g, (end - out) / s.fadeOut);
+  return clamp(g, 0, 1);
 }
 
 function draw() {
@@ -620,6 +766,8 @@ function animateVideo(t) {
   if (!video.paused &&
       (video.currentTime >= state.end || video.currentTime < state.start))
     video.currentTime = state.start;
+  if (!video.paused && (state.fadeIn || state.fadeOut))
+    video.volume = Math.min(1, state.volume) * fadeGain(state, video.currentTime);
   if (!video.requestVideoFrameCallback && mediaType === 'video' &&
       !video.paused && !video.seeking && t - lastFrame > 30) {
     draw();
@@ -646,6 +794,7 @@ function startVideoFrames() {
 video.addEventListener('seeked', () => {
   draw();
   syncTimeUI();
+  requestVideoReference();
 });
 video.addEventListener('loadeddata', () => {
   draw();
@@ -749,6 +898,9 @@ function framePx(v) {
 const signed = v => (+v > 0 ? '+' : '') + Math.round(v);
 const sliderFormats = {
   brightness: signed, contrast: signed, saturation: signed, warmth: signed,
+  shadows: signed, highlights: signed, lookStrength: v => Math.round(v) + '%',
+  straighten: v => (+v > 0 ? '+' : '') + (+v).toFixed(1) + '°',
+  fadeIn: v => (+v).toFixed(1) + ' s', fadeOut: v => (+v).toFixed(1) + ' s',
   brushSize: framePx, brushOpacity: v => Math.round(v * 100) + '%'
 };
 function sliderText(key, v) {
@@ -762,7 +914,7 @@ function slider(key, label, min, max, step = 1, name = label, trailing = '') {
       key}',this.value)"><output id="out-${key}">${
       sliderText(key, state[key])}</output>${trailing}</div>`
 }
-const adjustKeys = ['brightness', 'contrast', 'saturation', 'warmth', 'vignette'];
+const adjustKeys = ['brightness', 'contrast', 'saturation', 'warmth', 'shadows', 'highlights', 'vignette'];
 const adjustName = k => k[0].toUpperCase() + k.slice(1);
 // Each reset is a single undo step and does nothing when already at zero.
 function resetAdjustment(key) {
@@ -812,7 +964,9 @@ function lookThumbnail() {
           scale = 200 / Math.min(nativeW, nativeH);
     c.width = Math.round(nativeW * scale);
     c.height = Math.round(nativeH * scale);
-    c.getContext('2d').drawImage(photo ? previewImage || image : video, 0, 0, c.width, c.height);
+    const t = c.getContext('2d');
+    if (!photo && videoColorCorrection) t.filter = svgFilter(0, null, videoColorCorrection);
+    t.drawImage(photo ? previewImage || image : video, 0, 0, c.width, c.height);
     lookFrame = {key, url: c.toDataURL('image/jpeg', .8)};
   } catch (_) {
     lookFrame = {key, url: 'alpine.jpg'};
@@ -844,7 +998,8 @@ function renderTool() {
                       ''}</span><span>${l[0]}</span></button>`
             })
             .join('') +
-        '</div>'
+        '</div>' +
+        (state.look !== 'Original' ? slider('lookStrength', 'Strength', 0, 100, 1, 'Look strength') : '')
   }
   if (tool === 'adjust') {
     const name = adjustName(adjust);
@@ -1058,9 +1213,11 @@ async function doExport() {
         speed: state.speed,
         mute: state.mute,
         volume: state.volume,
+        fadeIn: state.fadeIn || 0,
+        fadeOut: state.fadeOut || 0,
         overlay: videoOverlay(),
         drawingLayers: videoDrawingLayers(),
-        textOverlay: videoTextOverlay()
+        textLayers: videoTextLayers()
       }));
       // The full-size ink canvases made for the overlays aren't needed again.
       directInkCaches.clear();
@@ -1069,6 +1226,36 @@ async function doExport() {
     directInkCaches.clear();
     exportError('Could not create this export. ' + e.message)
   }
+}
+// Saves the video frame under the playhead, with all its edits, as a JPEG photo.
+let savingFrame = false;
+async function saveFrame() {
+  if (exporting || mediaType !== 'video') return;
+  closeExportDropdown(false);
+  exporting = savingFrame = true;
+  Native.keepScreenOn?.(true);
+  $('saveFrameButton').disabled = $('saveButton').disabled = true;
+  $('exportStatus').textContent = 'Saving the frame…';
+  try {
+    const output = document.createElement('canvas');
+    renderTo(output, Math.max(nativeW, nativeH), false, state);
+    const blob = await encodePhoto(output, 'image/jpeg', .95);
+    output.width = output.height = 0;
+    directInkCaches.clear();
+    if (!blob) throw new Error('The frame could not be encoded');
+    await sendPhoto(blob);
+    const base = exportConfig.name.trim();
+    Native.photoFinish('jpg', base ? base + ' frame' : '');
+  } catch (e) {
+    exportError('Could not save the frame. ' + e.message);
+  }
+}
+function frameSaved(error = '') {
+  savingFrame = false;
+  $('saveFrameButton').disabled = $('saveButton').disabled = false;
+  $('exportStatus').textContent = error || 'Frame saved to Pictures/Luma';
+  if (!error) $('shareButton').classList.remove('hidden');
+  if (pendingImport) openPendingImport();
 }
 function exportGeometry(size = exportSize) {
   let g = geometry(state), max = size || Math.max(nativeW, nativeH),
@@ -1086,12 +1273,25 @@ function videoOverlay() {
       c.getContext('2d'), {...state, strokes: [], texts: [], text: ''});
   return c.toDataURL('image/png').split(',')[1];
 }
-function videoTextOverlay() {
-  if (!allTexts(state).length) return '';
-  const c = document.createElement('canvas');
-  [c.width, c.height] = exportGeometry();
-  paintAnnotations(c.getContext('2d'), {...state, strokes: [], vignette: 0});
-  return c.toDataURL('image/png').split(',')[1];
+// Text layers with the same timing share one overlay picture.
+function videoTextLayers() {
+  const groups = new Map();
+  for (const t of allTexts(state)) {
+    if (!t.text) continue;
+    const start = t.start || 0, end = t.end ?? duration;
+    if (start >= state.end || end <= state.start) continue;
+    const key = start + ':' + end;
+    if (!groups.has(key)) groups.set(key, {start, end, texts: []});
+    groups.get(key).texts.push(t);
+  }
+  return [...groups.values()].map(({start, end, texts}) => {
+    const c = document.createElement('canvas');
+    [c.width, c.height] = exportGeometry();
+    paintAnnotations(c.getContext('2d'), {...state, texts, strokes: [], vignette: 0, allTimes: true});
+    const overlay = c.toDataURL('image/png').split(',')[1];
+    c.width = c.height = 0;
+    return {overlay, start, end};
+  });
 }
 
 function videoDrawingLayers() {
@@ -1112,8 +1312,11 @@ function videoDrawingLayers() {
 // order as the preview: flips, rotation, crop, scale; then warmth, brightness, contrast and
 // saturation.
 function videoGeometry() {
-  const s = state, p = params(s), r = cropRect(s), [width, height] = exportGeometry();
+  const s = state, p = params(s), r = cropRect(s), [width, height] = exportGeometry(),
+        frame = geometry({...s, crop: null}), tone = toneTable(s);
   return {
+    straighten: s.straighten || 0, straightenScale: straightenScale(s), frameAspect: frame.w / frame.h,
+    ...(tone ? {tone} : {}),
     flipH: !!s.flip, flipV: !!s.flipY, rotation: s.rotation || 0,
     crop: {x: r.x, y: r.y, w: r.w, h: r.h}, width, height,
     warmth: warmthGains(Math.round(p.warm)), brightness: 1 + p.b / 100,
@@ -1149,6 +1352,7 @@ function exportFinalizing() {
 function exportDone(note = '') {
   exporting = false;
   Native.keepScreenOn?.(false);
+  if (savingFrame) { frameSaved(); return; }
   if (pendingImport) {
     toast('Saved to gallery');
     openPendingImport();
@@ -1167,6 +1371,7 @@ function exportDone(note = '') {
 function exportError(message) {
   exporting = false;
   Native.keepScreenOn?.(false);
+  if (savingFrame) { frameSaved(message); return; }
   $('saveButton').disabled = false;
   $('saveButton').innerHTML = icon('download') + 'Try again';
   $('saveButton').classList.remove('save-progress');

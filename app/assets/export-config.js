@@ -1,11 +1,11 @@
-let exportConfig = exportDefaults(), exportAdvancedOpen = false, exportDropdown = null, exportStreamingInfoOpen = false;
+let exportConfig = exportDefaults(), exportAdvancedOpen = false, exportDropdown = null;
 const exportDropdowns = new Map(), exportHelpOpen = new Set();
 let exportPhotoFormatExplicit = false, pendingPhotoTransparencyRefresh = false;
 function exportDefaults() {
   return {preset: 'balanced', codec: 'h264', crf: 23, fps: 0, fpsCap30: false,
     rateMode: 'quality', bitrate: 8, bitrateAutomatic: true,
     preferredPhotoFormat: null,
-    audioBitrate: 192, channels: 0, sampleRate: 0, fastStart: true, name: ''};
+    audioBitrate: 192, channels: 0, sampleRate: 0, name: ''};
 }
 const exportEnums = {
   codec: ['h264', 'hevc'], crf: [18, 20, 23, 28], fps: [0, 24, 25, 30, 50, 60],
@@ -15,7 +15,6 @@ const exportEnums = {
 function initializeExportSettings() {
   exportConfig = exportDefaults();
   exportAdvancedOpen = false;
-  exportStreamingInfoOpen = false;
   exportHelpOpen.clear();
   exportPhotoFormatExplicit = false;
   exportFormat = mediaType === 'photo' ? 'jpg' : 'mp4';
@@ -27,7 +26,6 @@ function initializeExportSettings() {
       if (options.includes(saved[key])) exportConfig[key] = saved[key];
     if (['quality', 'balanced', 'small', 'custom'].includes(saved.preset)) exportConfig.preset = saved.preset;
     exportConfig.fpsCap30 = typeof saved.fpsCap30 === 'boolean' ? saved.fpsCap30 : saved.preset === 'small';
-    if (typeof saved.fastStart === 'boolean') exportConfig.fastStart = saved.fastStart;
     if (typeof saved.customSize === 'boolean') exportConfig.customSize = saved.customSize;
     exportConfig.bitrateAutomatic = typeof saved.bitrateAutomatic === 'boolean' ?
         saved.bitrateAutomatic : saved.rateMode !== 'bitrate';
@@ -183,21 +181,6 @@ function setExportBitrate(value) {
   showCustomPreset();
   saveExportPreferences();
   updateExportSummary();
-}
-function toggleExportStreamingInfo() {
-  if (exporting) return;
-  exportStreamingInfoOpen = !exportStreamingInfoOpen;
-  $('streamingInfo').classList.toggle('hidden', !exportStreamingInfoOpen);
-  $('streamingInfoButton').setAttribute('aria-expanded', String(exportStreamingInfoOpen));
-  if (exportStreamingInfoOpen)
-    requestAnimationFrame(() => $('streamingInfo').scrollIntoView({block: 'nearest'}));
-}
-function setExportFastStart(value) {
-  if (exporting) return;
-  exportConfig.fastStart = value;
-  exportConfig.preset = 'custom';
-  showCustomPreset();
-  saveExportPreferences();
 }
 // Settings changed by hand leave the presets; a line under them says so.
 function presetChips() {
@@ -393,15 +376,16 @@ function renderExport() {
       content += exportSelect('exportCodec', 'Codec', exportConfig.codec, [['h264', 'H.264 · 8-bit'], ['hevc', 'HEVC / H.265 · 8-bit', 'HEVC · 8-bit']], 'codec', {topic:'codec', title:'About codecs and video color', text:'H.264 plays almost everywhere. HEVC makes smaller files at the same quality, but some older players can\'t open it. Both export 8-bit SDR video with the phone\'s hardware encoder.'});
     content += exportSelect('exportRateMode', 'Rate control', exportConfig.rateMode, [['quality', 'Quality'], ['bitrate', 'Target bitrate']], 'rateMode');
     if (exportConfig.rateMode === 'bitrate') content += `<div class="export-row"><div class="export-field-label"><label for="exportBitrate">Video · Mbps</label>${exportHelpButton('bitrate', 'About suggested bitrate')}</div><div class="export-bitrate-control"><input id="exportBitrate" class="field" type="number" min=".2" max="100" step=".1" value="${exportConfig.bitrate}" onchange="setExportBitrate(this.value)"><button type="button" class="chip ${exportConfig.bitrateAutomatic ? 'selected' : ''}" aria-label="Use suggested bitrate" aria-pressed="${exportConfig.bitrateAutomatic}" onclick="useSuggestedBitrate()">Auto</button></div></div>${exportHelpPanel('bitrate', 'Auto suggests a starting bitrate from resolution, frame rate and codec. Adjust it for motion and detail.')}`;
-    if (!state.mute) {
+    if (!state.mute && sourceHasAudio) {
       content += '<div class="export-group-label">Audio</div>';
       content += exportSelect('exportAudioBitrate', 'Quality', exportConfig.audioBitrate, [96,128,192,256].map(n => [n, n + ' kbps']), 'audioBitrate');
       content += exportSelect('exportChannels', 'Channels', exportConfig.channels, [[0, 'Original'], [2, 'Stereo'], [1, 'Mono']], 'channels');
       content += exportSelect('exportSampleRate', 'Sample rate', exportConfig.sampleRate, [[0, 'Original'], [44100, '44.1 kHz'], [48000, '48 kHz']], 'sampleRate');
     }
-    content += `<div class="export-streaming"><div class="export-switch"><label for="exportFastStart">Optimize for streaming</label><button id="streamingInfoButton" type="button" class="export-info-button" aria-label="About streaming optimization" aria-expanded="${exportStreamingInfoOpen}" aria-controls="streamingInfo" onclick="toggleExportStreamingInfo()"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7v.5"/></svg></button><input id="exportFastStart" type="checkbox" ${exportConfig.fastStart ? 'checked' : ''} onchange="setExportFastStart(this.checked)"></div><div id="streamingInfo" class="export-info ${exportStreamingInfoOpen ? '' : 'hidden'}" role="note"><p><strong>On:</strong> Plays while downloading; export may take longer.</p><p><strong>Off:</strong> Faster export; may need a full download to play.</p><p>Video quality stays the same.</p></div></div>`;
   }
   content += '</div></details></fieldset>';
+  if (!photo) content += `<button id="saveFrameButton" type="button" class="secondary save-frame" onclick="saveFrame()">${
+      icon('photo')}Save the frame at ${formatPreciseTime(video.currentTime)} as a photo</button>`;
   $('exportOptions').innerHTML = content;
   if (exporting) $('exportFields').disabled = true;
   updateExportSummary();
@@ -442,7 +426,7 @@ function estimatedVideoBytes() {
     const bpp = {18: .2, 20: .15, 23: .1, 28: .06}[exportConfig.crf] * (exportConfig.codec === 'hevc' ? .65 : 1);
     video = clamp(w * h * fps * bpp, 5e5, 1e8);
   }
-  const audio = state.mute ? 0 : exportConfig.audioBitrate * 1000;
+  const audio = state.mute || !sourceHasAudio ? 0 : exportConfig.audioBitrate * 1000;
   return (video + audio) * seconds / 8;
 }
 function formatSize(bytes) {
@@ -464,5 +448,5 @@ function videoExportOptions() {
     fps: exportConfig.fps, rateMode: exportConfig.rateMode, bitrate: exportConfig.bitrate,
     audioBitrate: exportConfig.audioBitrate,
     channels: exportConfig.channels, sampleRate: exportConfig.sampleRate,
-    fastStart: exportConfig.fastStart, name: exportConfig.name};
+    name: exportConfig.name};
 }

@@ -23,6 +23,10 @@ final class AudioPipeline {
     boolean cancelled();
     void progress(double fraction);
   }
+  // Volume (0..1) at an output time, for fades.
+  interface Envelope {
+    float gain(long outUs);
+  }
   // Filled in by the audio thread while the video is being encoded. The video thread
   // reads finished samples through its own file handle.
   static final class Result implements Closeable {
@@ -43,7 +47,7 @@ final class AudioPipeline {
 
   static void encode(Result result, File source, int track, long startUs, long durationUs,
       double speed, float volume, int wantChannels, int wantRate, int bitrate, File tmp,
-      Cancel cancel) throws Exception {
+      Envelope envelope, Cancel cancel) throws Exception {
     result.data = new RandomAccessFile(tmp, "rw");
     result.data.setLength(0);
     MediaExtractor extractor = new MediaExtractor();
@@ -188,7 +192,9 @@ final class AudioPipeline {
             pendingPos = 0;
           }
           for (int i = 0; i < allowed * outChannels; i++) {
-            float v = Math.max(-1f, Math.min(1f, ready.data[i]));
+            float v = ready.data[i];
+            if (envelope != null) v *= envelope.gain((outputFrames + i / outChannels) * 1_000_000L / outRate);
+            v = Math.max(-1f, Math.min(1f, v));
             pending[pendingLen++] = (short) Math.round(v * 32767f);
           }
           outputFrames += allowed;

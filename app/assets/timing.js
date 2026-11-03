@@ -1,4 +1,5 @@
-let drawingTimingOpen = false, rangeGesture = null, scrubGesture = null,
+const layerTimingOpen = {drawing: false, text: false};
+let rangeGesture = null, scrubGesture = null,
     lastPlaybackTimingUpdate = 0;
 // The shortest range a trim or layer can have: 0.2 s is at least two frames of output
 // even at 2× speed, so an export never comes out empty.
@@ -11,18 +12,22 @@ function normalizeTimings() {
   const gap = timeGap();
   state.start = clamp(Number(state.start) || 0, 0, Math.max(0, duration - gap));
   state.end = clamp(Number(state.end) || duration, state.start + gap, duration);
-  for (const layer of state.drawingLayers || []) {
+  for (const layer of [...(state.drawingLayers || []), ...(state.texts || [])]) {
     layer.start = clamp(Number(layer.start) || 0, 0, Math.max(0, duration - gap));
     if (layer.end != null)
       layer.end = clamp(Number(layer.end) || duration, layer.start + gap, duration);
   }
+  const length = (state.end - state.start) / state.speed;
+  state.fadeIn = clamp(state.fadeIn || 0, 0, Math.min(3, length));
+  state.fadeOut = clamp(state.fadeOut || 0, 0, Math.min(3, length - state.fadeIn));
+}
+// The layer a timing control edits: the selected drawing or text layer.
+function timedLayer(scope) {
+  return scope === 'drawing' ? selectedDrawing() : scope === 'text' ? selectedText() : null;
 }
 function timeRange(scope) {
-  if (scope === 'drawing')
-    return {
-      start: selectedDrawing()?.start || 0,
-      end: selectedDrawing()?.end ?? duration
-    };
+  if (scope !== 'trim')
+    return {start: timedLayer(scope)?.start || 0, end: timedLayer(scope)?.end ?? duration};
   return {start: state.start, end: state.end};
 }
 function drawingVisible(s, t = video.currentTime) {
@@ -38,7 +43,7 @@ function formatPreciseTime(t) {
 }
 
 function timeRangeControls(scope) {
-  const range = timeRange(scope), name = scope === 'trim' ? 'Trim' : 'Drawing';
+  const range = timeRange(scope), name = {trim: 'Trim', drawing: 'Drawing', text: 'Text'}[scope];
   return `<div class="time-range" data-time-range="${scope}" aria-label="${
       name} time range"><div class="time-range-rail"><div class="time-range-background"></div><div class="time-range-shade before"></div><div class="time-range-shade after"></div><div class="time-range-selection"></div><i class="time-range-playhead"></i><button class="time-range-handle start" data-range-handle="start" role="slider" aria-label="${
       name} start time" aria-valuemin="0" aria-valuemax="${
@@ -57,7 +62,24 @@ function timeRangeControls(scope) {
       range.end.toFixed(2)}" onchange="timeFieldChange(this)"></label></div>`;
 }
 function trimControls() {
-  return timeRangeControls('trim');
+  const length = (state.end - state.start) / state.speed;
+  return timeRangeControls('trim') +
+      `<div class="fade-row">${fadeSlider('fadeIn', 'Fade in', length)}${fadeSlider('fadeOut', 'Fade out', length)}</div>`;
+}
+// Fades from and to black, picture and sound, in seconds of the exported clip.
+function fadeSlider(key, label, length) {
+  const max = Math.max(0, Math.min(3, length - (key === 'fadeIn' ? state.fadeOut : state.fadeIn)));
+  return `<div class="slider-row"><label for="range-${key}">${label}</label><input id="range-${key}" type="range" aria-label="${
+      label}" min="0" max="${max.toFixed(1)}" step=".1" value="${state[key] || 0}" onpointerdown="commit()" onkeydown="if(!event.repeat)commit()" oninput="setFade('${
+      key}',+this.value)"><output id="out-${key}">${sliderText(key, state[key] || 0)}</output></div>`;
+}
+function setFade(key, value) {
+  state[key] = value;
+  $('out-' + key).value = sliderText(key, value);
+  const other = key === 'fadeIn' ? 'fadeOut' : 'fadeIn', length = (state.end - state.start) / state.speed;
+  if ($('range-' + other)) $('range-' + other).max = Math.max(0, Math.min(3, length - value)).toFixed(1);
+  persist();
+  draw();
 }
 function speedControls() {
   return '<div class="chips speed-options">' +
@@ -74,6 +96,8 @@ function setPlaybackSpeed(value) {
   renderTool();
 }
 function audioControls() {
+  if (!sourceHasAudio)
+    return '<p class="layer-hint">This video has no sound track the phone can play.</p>';
   const level = state.mute ? 0 : Math.round(state.volume * 100);
   return `<div class="slider-row audio-level"><label for="volumeLevel">Volume</label><input id="volumeLevel" aria-label="Volume" type="range" min="0" max="100" step="1" value="${
       level}" onpointerdown="commit()" onkeydown="if(!event.repeat)commit()" oninput="setVolumeLevel(+this.value)"><output id="volumeValue">${
@@ -89,28 +113,24 @@ function setVolumeLevel(value) {
   persist();
 }
 
-function drawingTimingControls() {
-  if (mediaType !== 'video' || !selectedDrawing()) return '';
-  let r = timeRange('drawing');
-  return `<button class="drawing-timing-toggle secondary ${
-             drawingTimingOpen ?
-                 'selected' :
-                 ''}" aria-label="Timing for selected drawing layer" aria-expanded="${
-             drawingTimingOpen}" onclick="toggleDrawingTiming()">${
-             icon(
-                 'clock')}<span>Layer timing</span><span class="drawing-time-summary">${
-             formatPreciseTime(
-                 r.start)}–${formatPreciseTime(r.end)}</span></button>` +
-      (drawingTimingOpen ?
-           '<div class="drawing-timing-panel">' + timeRangeControls('drawing') +
-               '<div class="drawing-timing-footer"><button class="reset" onclick="resetDrawingTiming()">Reset timing</button></div></div>' :
+// When a drawing or text layer is on screen in a video.
+function layerTimingControls(scope) {
+  if (mediaType !== 'video' || !timedLayer(scope)) return '';
+  const r = timeRange(scope), open = layerTimingOpen[scope];
+  return `<button class="drawing-timing-toggle secondary ${open ? 'selected' : ''}" aria-label="Timing for selected ${
+             scope} layer" aria-expanded="${open}" onclick="toggleLayerTiming('${scope}')">${
+             icon('clock')}<span>Layer timing</span><span class="drawing-time-summary" data-timing-summary="${scope}">${
+             formatPreciseTime(r.start)}–${formatPreciseTime(r.end)}</span></button>` +
+      (open ?
+           '<div class="drawing-timing-panel">' + timeRangeControls(scope) +
+               `<div class="drawing-timing-footer"><button class="reset" onclick="resetLayerTiming('${scope}')">Reset timing</button></div></div>` :
            '');
 }
-function toggleDrawingTiming() {
-  drawingTimingOpen = !drawingTimingOpen;
+function toggleLayerTiming(scope) {
+  layerTimingOpen[scope] = !layerTimingOpen[scope];
   renderTool();
   document.querySelector('.drawing-timing-panel')?.classList.add('reveal');
-  if (drawingTimingOpen)
+  if (layerTimingOpen[scope])
     requestAnimationFrame(() => {
       const area = document.querySelector('.tool-area'),
             toggle = document.querySelector('.drawing-timing-toggle');
@@ -123,7 +143,7 @@ function toggleDrawingTiming() {
 function setTimeEndpoint(
     scope, side, value, {record = false, seek = true} = {}) {
   if (!Number.isFinite(value) || duration <= 0 ||
-      (scope === 'drawing' && !selectedDrawing())) return false;
+      (scope !== 'trim' && !timedLayer(scope))) return false;
   if (record) commit();
   video.pause();
   const r = timeRange(scope), gap = timeGap();
@@ -133,7 +153,7 @@ function setTimeEndpoint(
   if (scope === 'trim')
     state[side] = value;
   else
-    selectedDrawing()[side] = value;
+    timedLayer(scope)[side] = value;
   const updated = timeRange(scope);
   if (seek)
     video.currentTime = side === 'end' ?
@@ -156,8 +176,8 @@ function timeFieldChange(input) {
   persist();
   syncTimeUI(true);
 }
-function resetDrawingTiming() {
-  const layer = selectedDrawing();
+function resetLayerTiming(scope) {
+  const layer = timedLayer(scope);
   if (!layer) return;
   commit();
   layer.start = 0;
@@ -166,9 +186,10 @@ function resetDrawingTiming() {
   syncTimeUI();
   draw();
 }
-function ensureDrawingPreviewTime() {
-  if (mediaType !== 'video' || !selectedDrawing()) return;
-  const r = timeRange('drawing');
+// Shows the selected layer: if the playhead is outside its time, it moves to its start.
+function ensureLayerPreviewTime(scope) {
+  if (mediaType !== 'video' || !timedLayer(scope)) return;
+  const r = timeRange(scope);
   if (video.currentTime < r.start || video.currentTime >= r.end)
     video.currentTime = r.start;
 }
@@ -241,9 +262,8 @@ function syncTimeUI(forceFields = false) {
           timeRange(field.dataset.timeScope)[field.dataset.timeField].toFixed(
               2);
   $('playTotal').textContent = '/ ' + formatPreciseTime(duration);
-  const summary = document.querySelector('.drawing-time-summary');
-  if (summary) {
-    const r = timeRange('drawing');
+  for (const summary of document.querySelectorAll('[data-timing-summary]')) {
+    const r = timeRange(summary.dataset.timingSummary);
     summary.textContent =
         formatPreciseTime(r.start) + '–' + formatPreciseTime(r.end);
   }

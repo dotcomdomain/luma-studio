@@ -7,6 +7,7 @@ import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.ImageDecoder;
 import android.net.Uri;
+import android.media.MediaCodec;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
 import android.os.*;
@@ -629,16 +630,38 @@ public class MainActivity extends Activity {
         for (int i = 0; i < extractor.getTrackCount(); i++) {
           MediaFormat format = extractor.getTrackFormat(i);
           String mime = format.getString(MediaFormat.KEY_MIME);
-          if (mime != null && mime.startsWith("video/")) {
+          // A sound track the phone can't read (DTS in MKV, for one) isn't listed at all.
+          if (mime != null && mime.startsWith("audio/")) info.put("audio", true);
+          if (mime != null && mime.startsWith("video/") && !info.has("fps")) {
             Number value = format.getNumber(MediaFormat.KEY_FRAME_RATE);
             if (value != null && Double.isFinite(value.doubleValue()) && value.doubleValue() > 0)
               info.put("fps", value.doubleValue());
-            break;
           }
         }
       } catch (Exception ignored) {
       } finally { extractor.release(); }
       return info.toString();
+    }
+    // A 32 × 18 RGB picture of the frame shown at `seconds`, decoded and converted to RGB
+    // exactly (with the matrix and range the decoder reports, as the video exporter does).
+    // The page compares it with the WebView's own picture of that frame, whose color
+    // conversion isn't always right. Answers through videoReferenceFrame(path, seconds, rgb).
+    @JavascriptInterface
+    public void videoReference(String path, double seconds) {
+      thumbnails.execute(() -> {
+        String reply = "null";
+        try {
+          File f = ownedFile(path);
+          int[] rgb = f == null ? null : referenceFrame(f, Math.round(seconds * 1e6), 32, 18);
+          if (rgb != null) {
+            boolean tall = rgb[rgb.length - 1] == 1; // the last entry marks a sideways frame
+            reply = new JSONObject().put("w", tall ? 18 : 32).put("h", tall ? 32 : 18)
+                .put("rgb", new JSONArray(Arrays.stream(rgb, 0, rgb.length - 1).boxed().toArray())).toString();
+          }
+        } catch (Exception ignored) {
+        }
+        js("videoReferenceFrame(" + JSONObject.quote(path) + "," + seconds + "," + reply + ")");
+      });
     }
     @JavascriptInterface
     public void demoVideo() {
@@ -716,6 +739,120 @@ public class MainActivity extends Activity {
       }, "luma-export").start();
     }
   }
+  static int[] referenceFrame(File f, long timeUs, int gw, int gh) throws Exception {
+    MediaExtractor extractor = new MediaExtractor();
+    MediaCodec decoder = null;
+    try {
+      extractor.setDataSource(f.toString());
+      MediaFormat format = null;
+      for (int i = 0; i < extractor.getTrackCount(); i++) {
+        MediaFormat t = extractor.getTrackFormat(i);
+        String mime = t.getString(MediaFormat.KEY_MIME);
+        if (mime != null && mime.startsWith("video/")) { extractor.selectTrack(i); format = t; break; }
+      }
+      if (format == null) return null;
+      extractor.seekTo(timeUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
+      decoder = MediaCodec.createDecoderByType(format.getString(MediaFormat.KEY_MIME));
+      decoder.configure(format, null, null, 0);
+      decoder.start();
+      MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+      long deadline = SystemClock.uptimeMillis() + 4000;
+      float[] kept = null;
+      boolean inputDone = false;
+      while (SystemClock.uptimeMillis() < deadline) {
+        if (!inputDone) {
+          int in = decoder.dequeueInputBuffer(2000);
+          if (in >= 0) {
+            int size = extractor.readSampleData(decoder.getInputBuffer(in), 0);
+            if (size < 0) { decoder.queueInputBuffer(in, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM); inputDone = true; }
+            else { decoder.queueInputBuffer(in, 0, size, extractor.getSampleTime(), 0); extractor.advance(); }
+          }
+        }
+        int o = decoder.dequeueOutputBuffer(info, 2000);
+        if (o < 0) continue;
+        boolean end = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
+        // The frame on screen at timeUs is the last one that starts at or before it.
+        if (info.size > 0 && (info.presentationTimeUs <= timeUs || kept == null)) {
+          android.media.Image image = decoder.getOutputImage(o);
+          // 8-bit frames only; a 10-bit (HDR) frame has 16-bit samples.
+          if (image != null && image.getFormat() != android.graphics.ImageFormat.YUV_420_888) {
+            image.close();
+            image = null;
+            inputDone = true;
+            kept = null;
+            decoder.releaseOutputBuffer(o, false);
+            break;
+          }
+          if (image != null) {
+            kept = averageYuv(image, gw, gh);
+            image.close();
+          }
+        }
+        decoder.releaseOutputBuffer(o, false);
+        if (end || (info.size > 0 && info.presentationTimeUs >= timeUs)) {
+          if (info.presentationTimeUs > timeUs || end) break;
+        }
+      }
+      if (kept == null) return null;
+      MediaFormat out = decoder.getOutputFormat();
+      int standard = out.containsKey(MediaFormat.KEY_COLOR_STANDARD) ? out.getInteger(MediaFormat.KEY_COLOR_STANDARD) : 0;
+      boolean full = out.containsKey(MediaFormat.KEY_COLOR_RANGE) &&
+          out.getInteger(MediaFormat.KEY_COLOR_RANGE) == MediaFormat.COLOR_RANGE_FULL;
+      int matrix = VideoExporter.Gl.matrixOf(standard);
+      double kr = .2126, kb = .0722;
+      if (matrix == 601 || (matrix == 0 && full)) { kr = .299; kb = .114; }
+      else if (matrix == 2020) { kr = .2627; kb = .0593; }
+      double kg = 1 - kr - kb, sy = full ? 1 : 255 / 219.0, sc = full ? 1 : 255 / 224.0, y0 = full ? 0 : 16;
+      // The rotation in the file's metadata is applied, as the WebView does.
+      int rotation = format.containsKey(MediaFormat.KEY_ROTATION) ? ((format.getInteger(MediaFormat.KEY_ROTATION) % 360) + 360) % 360 : 0;
+      boolean sideways = rotation % 180 != 0;
+      int ow = sideways ? gh : gw, oh = sideways ? gw : gh;
+      int[] rgb = new int[ow * oh * 3 + 1];
+      rgb[rgb.length - 1] = sideways ? 1 : 0;
+      for (int y = 0; y < gh; y++)
+        for (int x = 0; x < gw; x++) {
+          int i = (y * gw + x) * 3;
+          double Y = (kept[i] - y0) * sy, cb = (kept[i + 1] - 128) * sc, cr = (kept[i + 2] - 128) * sc;
+          double r = Y + 2 * (1 - kr) * cr, b = Y + 2 * (1 - kb) * cb, g = (Y - kr * r - kb * b) / kg;
+          int tx = x, ty = y;
+          if (rotation == 90) { tx = gh - 1 - y; ty = x; }
+          else if (rotation == 180) { tx = gw - 1 - x; ty = gh - 1 - y; }
+          else if (rotation == 270) { tx = y; ty = gw - 1 - x; }
+          int o = (ty * ow + tx) * 3;
+          rgb[o] = (int) Math.round(Math.max(0, Math.min(255, r)));
+          rgb[o + 1] = (int) Math.round(Math.max(0, Math.min(255, g)));
+          rgb[o + 2] = (int) Math.round(Math.max(0, Math.min(255, b)));
+        }
+      return rgb;
+    } finally {
+      if (decoder != null) try { decoder.stop(); } catch (Exception ignored) {} finally { decoder.release(); }
+      extractor.release();
+    }
+  }
+  // Mean Y, Cb, Cr (0-255 code values) of each cell of a gw × gh grid, from 8 × 8 samples per cell.
+  static float[] averageYuv(android.media.Image image, int gw, int gh) {
+    android.media.Image.Plane[] p = image.getPlanes();
+    android.graphics.Rect crop = image.getCropRect();
+    int w = crop.width(), h = crop.height();
+    float[] out = new float[gw * gh * 3];
+    for (int gy = 0; gy < gh; gy++)
+      for (int gx = 0; gx < gw; gx++) {
+        double sy = 0, su = 0, sv = 0;
+        for (int j = 0; j < 8; j++)
+          for (int i = 0; i < 8; i++) {
+            int x = crop.left + (int) ((gx + (i + .5) / 8) * w / gw), y = crop.top + (int) ((gy + (j + .5) / 8) * h / gh);
+            sy += p[0].getBuffer().get(y * p[0].getRowStride() + x * p[0].getPixelStride()) & 0xff;
+            int c = (y / 2) * p[1].getRowStride() + (x / 2) * p[1].getPixelStride();
+            su += p[1].getBuffer().get(c) & 0xff;
+            sv += p[2].getBuffer().get((y / 2) * p[2].getRowStride() + (x / 2) * p[2].getPixelStride()) & 0xff;
+          }
+        int k = (gy * gw + gx) * 3;
+        out[k] = (float) (sy / 64);
+        out[k + 1] = (float) (su / 64);
+        out[k + 2] = (float) (sv / 64);
+      }
+    return out;
+  }
   // Builds the export job from the page's settings and checks every value.
   VideoExporter videoJob(JSONObject j, File out) throws Exception {
     VideoExporter job = new VideoExporter();
@@ -746,6 +883,24 @@ public class MainActivity extends Activity {
     job.brightness = (float) j.optDouble("brightness", 1);
     job.contrast = (float) j.optDouble("contrast", 1);
     job.saturation = (float) j.optDouble("saturation", 1);
+    job.straighten = (float) j.optDouble("straighten", 0);
+    job.straightenScale = (float) j.optDouble("straightenScale", 1);
+    job.frameAspect = (float) j.optDouble("frameAspect", 1);
+    if (!Float.isFinite(job.straighten) || Math.abs(job.straighten) > 45 ||
+        !Float.isFinite(job.straightenScale) || job.straightenScale < 1 || job.straightenScale > 3 ||
+        !Float.isFinite(job.frameAspect) || job.frameAspect <= 0)
+      throw new Exception("Invalid straighten settings");
+    JSONArray tone = j.optJSONArray("tone");
+    if (tone != null) {
+      if (tone.length() < 2 || tone.length() > 256) throw new Exception("Invalid tone curve");
+      job.tone = new float[tone.length()];
+      for (int i = 0; i < tone.length(); i++) job.tone[i] = (float) tone.getDouble(i);
+    }
+    double fadeIn = j.optDouble("fadeIn", 0), fadeOut = j.optDouble("fadeOut", 0);
+    if (!(fadeIn >= 0 && fadeIn <= 10 && fadeOut >= 0 && fadeOut <= 10))
+      throw new Exception("Invalid fades");
+    job.fadeInUs = Math.round(fadeIn * 1e6);
+    job.fadeOutUs = Math.round(fadeOut * 1e6);
     JSONArray warm = j.optJSONArray("warmth");
     if (warm != null && warm.length() == 3)
       job.warmth = new float[] {(float) warm.getDouble(0), (float) warm.getDouble(1),
@@ -778,7 +933,8 @@ public class MainActivity extends Activity {
     job.audioBitrate = audioBitrate * 1000;
     job.channels = channels;
     job.sampleRate = sampleRate;
-    job.fastStart = j.optBoolean("fastStart", true);
+    // Always: the reordering costs nothing extra (it happens during the gallery copy).
+    job.fastStart = true;
     job.name = j.optString("name", "");
     job.listener = new VideoExporter.Listener() {
       int last = -1;
@@ -790,21 +946,25 @@ public class MainActivity extends Activity {
       }
       public boolean cancelled() { return cancelled; }
     };
-    // Overlays in drawing order: vignette, drawing layers (timed), text.
+    // Overlays in drawing order: vignette, drawing layers, text layers (both timed).
     addOverlay(job, j.optString("overlay", ""), 0, Long.MAX_VALUE);
-    JSONArray drawings = j.optJSONArray("drawingLayers");
-    if (drawings != null)
-      for (int i = 0; i < drawings.length(); i++) {
-        JSONObject layer = drawings.getJSONObject(i);
-        double inkStart = layer.optDouble("start", 0), inkEnd = layer.optDouble("end", start + duration);
-        if (!Double.isFinite(inkStart) || !Double.isFinite(inkEnd))
-          throw new Exception("Invalid drawing timing");
-        long from = Math.max(0, Math.round((inkStart - start) / speed * 1e6)),
-             to = inkEnd >= start + duration ? Long.MAX_VALUE : Math.round((inkEnd - start) / speed * 1e6);
-        if (to > from) addOverlay(job, layer.optString("overlay", ""), from, to);
-      }
+    addTimedOverlays(job, j.optJSONArray("drawingLayers"), start, duration, speed);
+    addTimedOverlays(job, j.optJSONArray("textLayers"), start, duration, speed);
     addOverlay(job, j.optString("textOverlay", ""), 0, Long.MAX_VALUE);
     return job;
+  }
+  // Layers with a start and end in source time; the exporter works in output time.
+  void addTimedOverlays(VideoExporter job, JSONArray layers, double start, double duration,
+      double speed) throws Exception {
+    if (layers == null) return;
+    for (int i = 0; i < layers.length(); i++) {
+      JSONObject layer = layers.getJSONObject(i);
+      double from = layer.optDouble("start", 0), until = layer.optDouble("end", start + duration);
+      if (!Double.isFinite(from) || !Double.isFinite(until)) throw new Exception("Invalid layer timing");
+      long fromUs = Math.max(0, Math.round((from - start) / speed * 1e6)),
+           toUs = until >= start + duration ? Long.MAX_VALUE : Math.round((until - start) / speed * 1e6);
+      if (toUs > fromUs) addOverlay(job, layer.optString("overlay", ""), fromUs, toUs);
+    }
   }
   void addOverlay(VideoExporter job, String base64, long fromUs, long toUs) throws IOException {
     if (base64.isEmpty()) return;

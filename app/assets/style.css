@@ -345,3 +345,4 @@ input[type=range]{height:44px}
 .preset-note{margin:-4px 0 10px;font-size:13px;line-height:18px;color:#c7d6be}
 @media(min-height:601px){.edit-actions .icon-btn,.timeline .icon-btn{width:48px;height:48px}.export-btn{min-height:48px}.frame-actions .secondary{min-height:48px}.time-range-handle{width:48px}.segment{min-height:44px}}
 .frame-mode-row .reset{white-space:nowrap}.layer-hint{min-height:48px;display:flex;align-items:center;margin:0 0 8px}
+.save-frame{width:100%;margin-top:16px;min-height:48px;gap:8px;font-size:14px}.save-frame svg{width:20px;height:20px;flex-shrink:0}.fade-row{margin-top:6px}

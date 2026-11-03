@@ -60,6 +60,11 @@ function sanitizeState() {
   for (const key of ['brightness', 'contrast', 'saturation', 'warmth'])
     state[key] = clamp(finiteOr(state[key], 0), -100, 100);
   state.vignette = clamp(finiteOr(state.vignette, 0), 0, 100);
+  for (const key of ['shadows', 'highlights']) state[key] = clamp(finiteOr(state[key], 0), -100, 100);
+  state.lookStrength = clamp(finiteOr(state.lookStrength, 100), 0, 100);
+  state.straighten = clamp(finiteOr(state.straighten, 0), -45, 45);
+  state.fadeIn = clamp(finiteOr(state.fadeIn, 0), 0, 3);
+  state.fadeOut = clamp(finiteOr(state.fadeOut, 0), 0, 3);
   if (!looks.some(l => l[0] === state.look)) state.look = d.look;
   state.rotation = ((Math.round(finiteOr(state.rotation, 0) / 90) * 90) % 360 + 360) % 360;
   state.ratio = Math.max(0, finiteOr(state.ratio, 0));
@@ -95,6 +100,8 @@ function sanitizeState() {
     t.size = finiteOr(t.size, 7);
     t.rotation = finiteOr(t.rotation, 0);
     t.opacity = clamp(finiteOr(t.opacity, 1), .1, 1);
+    t.start = Math.max(0, finiteOr(t.start, 0));
+    t.end = t.end == null ? null : finiteOr(t.end, null);
   }
 }
 function normalizeEdits() {
@@ -154,7 +161,8 @@ function prepareTool(t) {
   if (['crop', 'text', 'draw'].includes(t)) video.pause();
   if (t === 'crop' && tool !== 'crop')
     frameMode = state.crop || state.ratio ? 'position' : 'crop';
-  if (t === 'draw') ensureDrawingPreviewTime();
+  if (t === 'draw') ensureLayerPreviewTime('drawing');
+  if (t === 'text') ensureLayerPreviewTime('text');
 }
 function selectFrameMode(mode) {
   frameMode = mode;
@@ -182,6 +190,7 @@ function resetFrame() {
   while (state.rotation) turnContent();
   if (state.flip) flipContent('h');
   if (state.flipY) flipContent('v');
+  state.straighten = 0;
   state.crop = null;
   state.ratio = 0;
   frameMode = 'crop';
@@ -237,6 +246,8 @@ function flipContent(direction) {
     for (const point of stroke.points) point[axis] = 1 - point[axis];
   const key = (direction === 'h') !== !!(state.rotation % 180) ? 'flip' : 'flipY';
   state[key] = !state[key];
+  // A mirrored picture tilts the other way.
+  state.straighten = -(state.straighten || 0) || 0;
   strokeRevision++;
 }
 function flipFrame(direction) {
@@ -281,6 +292,7 @@ function frameControls() {
       `<div class="slider-row"><label for="frameZoom">Zoom</label><input id="frameZoom" aria-label="Frame zoom" type="range" min="1" max="8" step=".05" value="${
              zoomAmount()}" onpointerdown="commit()" onkeydown="if(!event.repeat)commit()" oninput="zoomFrame(+this.value)"><output id="frameZoomValue">${
              zoomAmount().toFixed(1)}×</output></div>` +
+      slider('straighten', 'Straighten', -45, 45, .1) +
       '<div class="frame-actions"><button class="secondary" onclick="rotateFrame()">' +
       icon('rotate') +
       'Rotate</button><button class="secondary" aria-label="Flip horizontally" onclick="flipFrame(\'h\')">' +
@@ -304,7 +316,9 @@ function addText(record = true) {
     rotation: 0,
     opacity: 1,
     outline: false,
-    background: false
+    background: false,
+    start: 0,
+    end: null
   };
   state.texts.push(t);
   state.activeTextId = t.id;
@@ -332,6 +346,7 @@ function centerText() {
 }
 function selectText(id) {
   state.activeTextId = id;
+  ensureLayerPreviewTime('text');
   renderTool();
   draw();
 }
@@ -403,7 +418,7 @@ function textControls() {
               t.opacity}" onpointerdown="commit()" onkeydown="if(!event.repeat)commit()" oninput="textChange('opacity',+this.value,false,false);this.nextElementSibling.value=Math.round(this.value*100)+'%'"><output>${
               Math.round(t.opacity * 100)}%</output></div>` :
       '';
-  return layers + basic + style;
+  return layers + basic + style + layerTimingControls('text');
 }
 function bindEditingControls() {
   if (tool === 'text' && $('textInput')) {
@@ -459,7 +474,7 @@ function addDrawingLayer(record = true) {
   state.drawingLayers.push(layer);
   state.activeDrawingId = layer.id;
   if (record) {
-    ensureDrawingPreviewTime();
+    ensureLayerPreviewTime('drawing');
     persist();
     renderTool();
     draw();
@@ -469,7 +484,7 @@ function addDrawingLayer(record = true) {
 function selectDrawing(id) {
   state.activeDrawingId = id;
   video.pause();
-  ensureDrawingPreviewTime();
+  ensureLayerPreviewTime('drawing');
   persist();
   renderTool();
   draw();
@@ -484,7 +499,7 @@ function deleteDrawingLayer() {
   state.strokes = state.strokes.filter(s => s.layerId !== layer.id);
   state.activeDrawingId = state.drawingLayers.at(-1)?.id || null;
   strokeRevision++;
-  ensureDrawingPreviewTime();
+  ensureLayerPreviewTime('drawing');
   persist();
   renderTool();
   draw();
@@ -522,7 +537,7 @@ function penControls() {
       state.brushMode + ' width and opacity" title="Reset ' + state.brushMode + ' width and opacity">' + icon('reset') + '</button></div>' +
       slider('brushSize', 'Width', .2, 8, .1) +
       (state.brushMode === 'eraser' ? '' : slider('brushOpacity', 'Opacity', .1, 1, .05)) +
-      drawingTimingControls();
+      layerTimingControls('drawing');
 }
 const previewInkCaches = new Map(), directInkCaches = new Map();
 // strokeRevision changes whenever strokes are added, removed or transformed. A stroke that
@@ -683,7 +698,7 @@ function paintAnnotations(c, s) {
   renderStrokes(c, s);
   let bounds = [];
   for (const t of allTexts(s)) {
-    if (!t.text) continue;
+    if (!t.text || (!s.allTimes && !drawingVisible(t))) continue;
     c.save();
     let m = textMetrics(c, t, s), frame = cropRect(s),
         x = (t.x - frame.x) / frame.w * w, y = (t.y - frame.y) / frame.h * h,
@@ -864,6 +879,7 @@ surface.addEventListener('pointerdown', e => {
     if (!id) return;
     // Selecting a layer isn't an edit; only moving it is.
     state.activeTextId = id;
+    ensureLayerPreviewTime('text');
     commit();
     const text = selectedText();
     gesture = {
@@ -882,7 +898,7 @@ surface.addEventListener('pointerdown', e => {
     draw();
   }
   if (tool === 'draw') {
-    ensureDrawingPreviewTime();
+    ensureLayerPreviewTime('drawing');
     commit();
     // The first stroke on a picture with no drawing layer starts one.
     const layer = selectedDrawing() || addDrawingLayer(false);
