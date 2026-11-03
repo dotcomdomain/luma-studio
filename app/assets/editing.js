@@ -4,7 +4,10 @@ const gestureHintsSeen = (() => {
 })();
 const toolDropdowns = new Map();
 let focusNewText = false;
-let frameMode = 'crop', textStyleOpen = false, gesture = null;
+let textStyleOpen = false, gesture = null;
+// The Frame tool shows the crop box on a zoomed view of the picture. The view stays put
+// while an edge is dragged (frameView), then eases to fit the new crop (frameViewAnim).
+let frameView = null, frameViewAnim = null, shownFrameView = null;
 let strokeRevision = 0, textBounds = [], nextLayer = 0;
 const activePointers = new Map();
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
@@ -18,6 +21,39 @@ function fitRect(aspect) {
   else
     rh = w / aspect / h;
   return {x: (1 - rw) / 2, y: (1 - rh) / 2, w: rw, h: rh};
+}
+// The part of the picture the Frame tool shows: the crop plus a margin, shaped like the
+// preview. Dragging an edge outward reaches into the margin, and letting go zooms out to
+// show more, so a crop can always be undone by dragging back out.
+function fitFrameView(r) {
+  let W = nativeW || 1, H = nativeH || 1;
+  if (state.rotation % 180) [W, H] = [H, W];
+  const p = $('preview'), aw = Math.max(1, p.clientWidth - 44), ah = Math.max(1, p.clientHeight - 44),
+        fill = .84, vwPx = Math.max(r.w * W / fill, r.h * H / fill * aw / ah),
+        vw = Math.min(1, vwPx / W), vh = Math.min(1, vwPx * ah / aw / H),
+        cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+  return {x: clamp(cx - vw / 2, 0, 1 - vw), y: clamp(cy - vh / 2, 0, 1 - vh), w: vw, h: vh};
+}
+function frameViewRect() {
+  if (frameView) return frameView;
+  const target = fitFrameView(cropRect());
+  if (!frameViewAnim) return target;
+  const t = Math.min(1, (performance.now() - frameViewAnim.start) / 240);
+  if (t >= 1) {
+    frameViewAnim = null;
+    return target;
+  }
+  const e = 1 - (1 - t) ** 3, f = frameViewAnim.from;
+  draw();
+  return {
+    x: f.x + (target.x - f.x) * e, y: f.y + (target.y - f.y) * e,
+    w: f.w + (target.w - f.w) * e, h: f.h + (target.h - f.h) * e
+  };
+}
+function releaseFrameView() {
+  if (!frameView) return;
+  frameViewAnim = {from: frameView, start: performance.now()};
+  frameView = null;
 }
 function boundedRect(r) {
   let w = clamp(+r.w || 1, .02, 1), h = clamp(+r.h || 1, .02, 1);
@@ -159,15 +195,9 @@ function selectedText() {
 }
 function prepareTool(t) {
   if (['crop', 'text', 'draw'].includes(t)) video.pause();
-  if (t === 'crop' && tool !== 'crop')
-    frameMode = state.crop || state.ratio ? 'position' : 'crop';
+  if (t === 'crop' && tool !== 'crop') frameView = frameViewAnim = null;
   if (t === 'draw') ensureLayerPreviewTime('drawing');
   if (t === 'text') ensureLayerPreviewTime('text');
-}
-function selectFrameMode(mode) {
-  frameMode = mode;
-  renderTool();
-  draw();
 }
 function framePreset(aspect) {
   commit();
@@ -175,11 +205,9 @@ function framePreset(aspect) {
   if (aspect === 'free') {
     state.ratio = 0;
     state.crop = previous;
-    frameMode = 'crop';
   } else {
     state.ratio = aspect;
     state.crop = aspect ? fitRect(aspect) : null;
-    frameMode = aspect ? 'position' : 'crop';
   }
   persist();
   renderTool();
@@ -193,7 +221,6 @@ function resetFrame() {
   state.straighten = 0;
   state.crop = null;
   state.ratio = 0;
-  frameMode = 'crop';
   persist();
   renderTool();
   draw();
@@ -284,11 +311,6 @@ function frameControls() {
                   `framePreset(${v})`))
           .join('') +
       '</div>' +
-      '<div class="frame-mode-row"><div class="segmented" role="group" aria-label="What dragging does">' +
-      [['crop', 'Crop edges'], ['position', 'Move picture']].map(([mode, label]) =>
-          `<button class="segment ${frameMode === mode ? 'selected' : ''}" aria-pressed="${
-              frameMode === mode}" onclick="selectFrameMode('${mode}')">${label}</button>`).join('') +
-      '</div><button class="reset" onclick="resetFrame()">Reset frame</button></div>' +
       `<div class="slider-row"><label for="frameZoom">Zoom</label><input id="frameZoom" aria-label="Frame zoom" type="range" min="1" max="8" step=".05" value="${
              zoomAmount()}" onpointerdown="commit()" onkeydown="if(!event.repeat)commit()" oninput="zoomFrame(+this.value)"><output id="frameZoomValue">${
              zoomAmount().toFixed(1)}×</output></div>` +
@@ -298,7 +320,8 @@ function frameControls() {
       'Rotate</button><button class="secondary" aria-label="Flip horizontally" onclick="flipFrame(\'h\')">' +
       icon('flip') +
       'Flip H</button><button class="secondary" aria-label="Flip vertically" onclick="flipFrame(\'v\')">' +
-      icon('flip-v') + 'Flip V</button></div>';
+      icon('flip-v') + 'Flip V</button><button class="secondary" aria-label="Reset frame" onclick="resetFrame()">' +
+      icon('reset') + 'Reset</button></div>';
 }
 function addText(record = true) {
   if (record) commit();
@@ -765,15 +788,16 @@ function syncInteraction() {
   layer.classList.toggle('interactive', interactive);
   if (layer.dataset.tool !== tool) layer.dataset.tool = tool;
   const cropUI = $('cropOverlay'), selection = $('textSelection');
-  const showCrop = tool === 'crop' && frameMode === 'crop' && !comparing;
+  const showCrop = tool === 'crop' && !comparing;
   const bound = tool === 'text' && !comparing && textBounds.find(t => t.id === state.activeTextId);
   cropUI.classList.toggle('hidden', !showCrop);
   selection.classList.toggle('hidden', !bound);
   if (!interactive && !showCrop && !bound) return;
   const rectKey = canvas.width + 'x' + canvas.height + '@' + previewLayoutVersion;
   if (rectKey !== layerRectKey) {
-    const b = canvas.getBoundingClientRect(), p = $('preview').getBoundingClientRect();
-    layerRect = {left: b.left - p.left, top: b.top - p.top, width: b.width, height: b.height};
+    // Layout offsets, not getBoundingClientRect: the editor's opening animation scales the
+    // screen, and a rect measured during it would stay slightly off afterwards.
+    layerRect = {left: canvas.offsetLeft, top: canvas.offsetTop, width: canvas.offsetWidth, height: canvas.offsetHeight};
     layerRectKey = rectKey;
     layer.style.left = layerRect.left + 'px';
     layer.style.top = layerRect.top + 'px';
@@ -781,12 +805,12 @@ function syncInteraction() {
     layer.style.height = layerRect.height + 'px';
   }
   if (showCrop) {
-    let r = cropRect();
+    const r = cropRect(), v = shownFrameView || frameViewRect();
     Object.assign(cropUI.style, {
-      left: r.x * 100 + '%',
-      top: r.y * 100 + '%',
-      width: r.w * 100 + '%',
-      height: r.h * 100 + '%'
+      left: (r.x - v.x) / v.w * 100 + '%',
+      top: (r.y - v.y) / v.h * 100 + '%',
+      width: r.w / v.w * 100 + '%',
+      height: r.h / v.h * 100 + '%'
     });
   }
   if (bound) {
@@ -807,8 +831,7 @@ function syncInteraction() {
 // One short hint per gesture, shown until it has been used once.
 function currentHint() {
   if (tool === 'crop')
-    return frameMode === 'crop' ? ['cropcrop', 'Drag the handles to crop'] :
-        ['cropposition', 'Drag or pinch to move the picture'];
+    return ['frame', 'Drag an edge to crop. Drag or pinch to move the picture'];
   if (tool === 'text') return ['text', 'Drag text to move it'];
   if (tool === 'draw') return ['draw', 'Draw on the picture'];
   if (mediaType !== 'video') return ['', ''];
@@ -851,9 +874,11 @@ surface.addEventListener('pointerdown', e => {
   activePointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
   if (activePointers.size === 2 && tool === 'crop') {
     let pts = [...activePointers.values()];
+    frameView = frameViewAnim = null;
     gesture = {
       kind: 'pinch',
       r: cropRect(),
+      view: frameViewRect(),
       distance: Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y),
       mid: {x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2},
       bounds: surface.getBoundingClientRect()
@@ -865,10 +890,15 @@ surface.addEventListener('pointerdown', e => {
   let point = localPoint(e, bounds);
   if (tool === 'crop') {
     commit();
+    const handle = e.target.dataset.handle, view = shownFrameView || frameViewRect();
+    // An edge keeps the view still under the finger; moving the picture refits it as it goes.
+    frameViewAnim = null;
+    frameView = handle ? view : null;
     gesture = {
-      kind: frameMode === 'crop' ? 'crop' : 'pan',
+      kind: handle ? 'crop' : 'pan',
       r: cropRect(),
-      handle: e.target.dataset.handle || 'move',
+      view,
+      handle,
       start: {x: e.clientX, y: e.clientY},
       bounds,
       pointer: e.pointerId
@@ -928,24 +958,21 @@ surface.addEventListener('pointermove', e => {
           scale = clamp(distance / Math.max(1, g.distance), .1, 10),
           maxBase = Math.min(1 / g.r.w, 1 / g.r.h),
           mid = {x: (p[0].x + p[1].x) / 2, y: (p[0].y + p[1].y) / 2};
-    if (frameMode === 'crop') {
-      // The whole picture is shown with the crop box on it: spreading the fingers grows
-      // the box and moving them moves the box with them.
-      const factor = clamp(scale, Math.max(.02 / g.r.w, .02 / g.r.h), maxBase),
-            w = g.r.w * factor, h = g.r.h * factor,
-            dx = (mid.x - g.mid.x) / g.bounds.width, dy = (mid.y - g.mid.y) / g.bounds.height;
-      state.crop = boundedRect({x: g.r.x + (g.r.w - w) / 2 + dx, y: g.r.y + (g.r.h - h) / 2 + dy, w, h});
-    } else {
-      // The crop fills the preview: spreading zooms in on the point between the fingers,
-      // which stays under them while they move.
-      const factor = clamp(1 / scale, Math.max(.02 / g.r.w, .02 / g.r.h), maxBase),
-            w = g.r.w * factor, h = g.r.h * factor,
-            ax = clamp((g.mid.x - g.bounds.left) / g.bounds.width, 0, 1),
-            ay = clamp((g.mid.y - g.bounds.top) / g.bounds.height, 0, 1),
-            bx = clamp((mid.x - g.bounds.left) / g.bounds.width, 0, 1),
-            by = clamp((mid.y - g.bounds.top) / g.bounds.height, 0, 1);
-      state.crop = boundedRect({x: g.r.x + ax * g.r.w - bx * w, y: g.r.y + ay * g.r.h - by * h, w, h});
-    }
+    // Spreading zooms in on the point between the fingers, which stays under them while
+    // they move. The view is refitted around the crop at the same proportion, so a point's
+    // place on screen follows from its offset to the crop's centre. d0 is how far an
+    // edge-clamped view starts off centre; it scales with the crop so nothing jumps.
+    const v = g.view, kx = v.w / g.r.w, ky = v.h / g.r.h,
+          factor = clamp(1 / scale, Math.max(.02 / g.r.w, .02 / g.r.h), maxBase),
+          w = g.r.w * factor, h = g.r.h * factor,
+          m0x = (g.mid.x - g.bounds.left) / g.bounds.width, m0y = (g.mid.y - g.bounds.top) / g.bounds.height,
+          mx = (mid.x - g.bounds.left) / g.bounds.width, my = (mid.y - g.bounds.top) / g.bounds.height,
+          ax = v.x + m0x * v.w, ay = v.y + m0y * v.h,
+          d0x = g.r.x + g.r.w / 2 - (ax - (m0x - .5) * kx * g.r.w),
+          d0y = g.r.y + g.r.h / 2 - (ay - (m0y - .5) * ky * g.r.h),
+          cx = ax - (mx - .5) * kx * w + d0x * factor,
+          cy = ay - (my - .5) * ky * h + d0y * factor;
+    state.crop = boundedRect({x: cx - w / 2, y: cy - h / 2, w, h});
     draw();
     return;
   }
@@ -955,18 +982,17 @@ surface.addEventListener('pointermove', e => {
         dy = (e.clientY - (g.start?.y || 0)) / g.bounds.height;
   if (g.kind === 'pan')
     state.crop =
-        boundedRect({...g.r, x: g.r.x - dx * g.r.w, y: g.r.y - dy * g.r.h});
+        boundedRect({...g.r, x: g.r.x - dx * g.view.w, y: g.r.y - dy * g.view.h});
   if (g.kind === 'crop') {
-    let r = {...g.r}, h = g.handle;
-    if (h === 'move') {
-      r.x += dx;
-      r.y += dy;
-    } else {
+    // An edge can go as far as the view shows: inward to crop, outward into the margin.
+    let r = {...g.r}, h = g.handle, v = g.view;
+    const L = v.x, T = v.y, R = v.x + v.w, B = v.y + v.h, ex = dx * v.w, ey = dy * v.h;
+    {
       let left = g.r.x, top = g.r.y, right = left + g.r.w, bottom = top + g.r.h;
-      if (h.includes('w')) left = clamp(left + dx, 0, right - .02);
-      if (h.includes('e')) right = clamp(right + dx, left + .02, 1);
-      if (h.includes('n')) top = clamp(top + dy, 0, bottom - .02);
-      if (h.includes('s')) bottom = clamp(bottom + dy, top + .02, 1);
+      if (h.includes('w')) left = clamp(left + ex, L, right - .02);
+      if (h.includes('e')) right = clamp(right + ex, left + .02, R);
+      if (h.includes('n')) top = clamp(top + ey, T, bottom - .02);
+      if (h.includes('s')) bottom = clamp(bottom + ey, top + .02, B);
       r = {x: left, y: top, w: right - left, h: bottom - top};
       if (state.ratio) {
         let aspect = g.r.w / g.r.h, fw = r.w, fh = r.h;
@@ -979,8 +1005,8 @@ surface.addEventListener('pointermove', e => {
         if (h.includes('w')) r.x = g.r.x + g.r.w - fw;
         if (h.includes('n')) r.y = g.r.y + g.r.h - fh;
         let limit = Math.min(
-            1, (h.includes('w') ? g.r.x + g.r.w : 1 - r.x) / fw,
-            (h.includes('n') ? g.r.y + g.r.h : 1 - r.y) / fh);
+            1, (h.includes('w') ? g.r.x + g.r.w - L : R - r.x) / fw,
+            (h.includes('n') ? g.r.y + g.r.h - T : B - r.y) / fh);
         fw *= limit;
         fh *= limit;
         if (h.includes('w')) r.x = g.r.x + g.r.w - fw;
@@ -1029,6 +1055,7 @@ function endGesture(e) {
     persist();
     gesture = null;
   }
+  if (!activePointers.size || gesture?.pointer === e.pointerId) releaseFrameView();
   // Lifting the finger that drives a one-finger gesture ends it, even if another finger
   // is still resting on the screen.
   const ownerLifted = gesture && gesture.pointer === e.pointerId;
@@ -1043,7 +1070,11 @@ function endGesture(e) {
 }
 surface.addEventListener('pointerup', endGesture);
 surface.addEventListener('pointercancel', endGesture);
-new ResizeObserver(() => { previewLayoutVersion++; syncInteraction(); }).observe($('preview'));
+// The canvas can change its on-screen size without the preview resizing (the Frame tool's
+// padding, a new view shape), so both are watched.
+const previewResize = new ResizeObserver(() => { previewLayoutVersion++; syncInteraction(); });
+previewResize.observe($('preview'));
+previewResize.observe(canvas);
 $('toolContent').addEventListener('keydown', event => {
   const trigger = event.target.closest('.export-dropdown');
   if (!trigger || !['ArrowDown', 'ArrowUp'].includes(event.key)) return;

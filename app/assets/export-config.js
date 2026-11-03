@@ -340,6 +340,12 @@ window.visualViewport?.addEventListener('resize', positionExportDropdown);
 document.querySelector('.export-sheet').addEventListener('scroll', () => closeExportDropdown());
 // In landscape the options scroll inside their own column.
 $('exportOptions').addEventListener('scroll', () => closeExportDropdown());
+// Opening More options near the bottom of the sheet would leave the new options out of
+// view; scroll them in, keeping the summary row visible.
+function revealExportAdvanced(details) {
+  if (exporting) return;
+  requestAnimationFrame(() => details.scrollIntoView({block: 'nearest', behavior: 'smooth'}));
+}
 function renderExport() {
   closeExportDropdown(false);
   exportDropdowns.clear();
@@ -364,13 +370,13 @@ function renderExport() {
     const maximum = exportOutputDimensions(Math.min(source, 8192));
     content += `<div class="export-dimensions" role="group" aria-label="Custom resolution, aspect ratio preserved"><label for="exportCustomWidth">Width<input id="exportCustomWidth" class="field" type="number" min="2" max="${maximum[0]}" step="${photo ? 1 : 2}" value="${dimensions[0]}" onchange="setExportDimension('width',this.value)"></label><span aria-hidden="true">×</span><label for="exportCustomHeight">Height<input id="exportCustomHeight" class="field" type="number" min="2" max="${maximum[1]}" step="${photo ? 1 : 2}" value="${dimensions[1]}" onchange="setExportDimension('height',this.value)"></label></div>`;
   }
-  if (photo && exportFormat !== 'png') content += `<div class="export-quality"><div><div class="export-quality-label"><label for="exportQuality">Compression quality</label>${exportHelpButton('quality', 'About compression quality')}</div><output id="exportQualityValue">${Math.round(quality * 100)}%</output></div><input id="exportQuality" type="range" min="50" max="100" value="${Math.round(quality * 100)}" oninput="setPhotoExportQuality(this.value)">${exportHelpPanel('quality', 'JPEG and WebP are lossy, even at 100%. Choose PNG for lossless output.')}</div>`;
   if (!photo && exportConfig.rateMode === 'quality') content += exportSelect('exportVideoQuality', 'Quality', exportConfig.crf,
       [[18, 'Highest'], [20, 'High'], [23, 'Standard'], [28, 'Compact']], 'crf', {topic:'quality', title:'About video quality', text:'Highest is the least compressed option here, not lossless. Higher quality generally makes larger files.'});
   if (!photo) content += exportSelect('exportFps', 'Frame rate', exportConfig.fps,
       [[0, 'Original'], ...[24,25,30,50,60].map(n => [n, n + ' fps'])], 'fps');
+  content += `<details class="export-advanced" ${exportAdvancedOpen ? 'open' : ''} ontoggle="if(this.open&&!exportAdvancedOpen)revealExportAdvanced(this);exportAdvancedOpen=this.open"><summary><span>More options</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></summary><div class="export-advanced-body">`;
+  if (photo && exportFormat !== 'png') content += `<div class="export-quality"><div><div class="export-quality-label"><label for="exportQuality">Compression quality</label>${exportHelpButton('quality', 'About compression quality')}</div><output id="exportQualityValue">${Math.round(quality * 100)}%</output></div><input id="exportQuality" type="range" min="50" max="100" value="${Math.round(quality * 100)}" oninput="setPhotoExportQuality(this.value)">${exportHelpPanel('quality', 'JPEG and WebP are lossy, even at 100%. Choose PNG for lossless output.')}</div>`;
   content += `<div class="export-name"><label for="exportName">File name</label><div><input id="exportName" class="field" type="text" maxlength="64" placeholder="Automatic" value="${exportEscape(exportConfig.name)}" oninput="exportConfig.name=this.value"><span>.${exportFormat}</span></div></div>`;
-  content += `<details class="export-advanced" ${exportAdvancedOpen ? 'open' : ''} ontoggle="exportAdvancedOpen=this.open"><summary><span>More options</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></summary><div class="export-advanced-body">`;
   if (!photo) {
     if (videoEncoders().hevc)
       content += exportSelect('exportCodec', 'Codec', exportConfig.codec, [['h264', 'H.264 · 8-bit'], ['hevc', 'HEVC / H.265 · 8-bit', 'HEVC · 8-bit']], 'codec', {topic:'codec', title:'About codecs and video color', text:'H.264 plays almost everywhere. HEVC makes smaller files at the same quality, but some older players can\'t open it. Both export 8-bit SDR video with the phone\'s hardware encoder.'});

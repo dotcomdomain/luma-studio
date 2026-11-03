@@ -288,7 +288,7 @@ async function makePreviewImage(sequence) {
 function ready() {
   normalizeEdits();
   normalizeTimings();
-  setTool(mediaType==='video'?'trim':'looks');
+  setTool((mediaType === 'video' ? videoToolOrder : photoToolOrder)[0]);
   draw();
   updateHistory();
 }
@@ -729,15 +729,16 @@ function draw() {
   drawPending = true;
   requestAnimationFrame(() => {
     drawPending = false;
-    const cropView = tool === 'crop' && frameMode === 'crop' && !comparing;
+    const cropView = tool === 'crop' && !comparing;
     // The crop stage adds padding, which moves the canvas without resizing it.
     if ($('preview').classList.contains('crop-stage') !== cropView) {
       $('preview').classList.toggle('crop-stage', cropView);
       previewLayoutVersion++;
     }
+    shownFrameView = cropView ? frameViewRect() : null;
     const view = cropView ? {
       ...state,
-      crop: null,
+      crop: shownFrameView,
       annotationSpace: 2,
       ratio: 0,
       vignette: 0,
@@ -746,7 +747,7 @@ function draw() {
       strokes: state.strokes
     } :
                             state;
-    const previewLimit = gesture || sliderActive ? 720 :
+    const previewLimit = gesture || sliderActive || frameViewAnim ? 720 :
         mediaType === 'video'    ? (video.paused ? 900 : 720) :
                                    1400;
     renderTo(canvas, previewLimit, comparing, view);

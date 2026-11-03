@@ -1,5 +1,6 @@
-const photoToolOrder = ['looks', 'adjust', 'crop', 'text', 'draw'];
-const videoToolOrder = ['trim', 'playback', 'crop', 'adjust', 'looks', 'text', 'draw'];
+// Most used first. The editor opens on the first one.
+const photoToolOrder = ['crop', 'adjust', 'looks', 'text', 'draw'];
+const videoToolOrder = ['trim', 'crop', 'playback', 'adjust', 'looks', 'text', 'draw'];
 function configureNavigation(type) {
   const order = type === 'video' ? videoToolOrder : photoToolOrder;
   document.querySelectorAll('.tool-nav [data-tool]').forEach(button => {
