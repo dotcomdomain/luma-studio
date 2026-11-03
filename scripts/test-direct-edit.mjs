@@ -1,0 +1,34 @@
+import {evaluate,call,close} from './cdp.mjs';
+import fs from 'node:fs';
+const results={};
+const pause=ms=>new Promise(r=>setTimeout(r,ms));
+async function settle(){await evaluate('new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))');}
+function check(ok,message){if(!ok)throw new Error(message);}
+async function bounds(){return evaluate(`$('gestureLayer').getBoundingClientRect().toJSON()`);}
+async function touch(type,points){await call('Input.dispatchTouchEvent',{type,touchPoints:points.map((p,i)=>({x:p.x,y:p.y,id:p.id??i+1,radiusX:3,radiusY:3,force:1}))});}
+async function drag(from,to,steps=12){await touch('touchStart',[from]);for(let i=1;i<=steps;i++)await touch('touchMove',[{x:from.x+(to.x-from.x)*i/steps,y:from.y+(to.y-from.y)*i/steps}]);await touch('touchEnd',[]);await settle();}
+async function shot(name){const old=fs.statSync('artifacts/display.png').mtimeMs;fs.writeFileSync('artifacts/capture.request','');await evaluate('draw()');for(let i=0;i<80;i++){await pause(50);if(fs.statSync('artifacts/display.png').mtimeMs>old){let bytes=fs.readFileSync('artifacts/display.png');if(bytes.subarray(-8).toString('hex')==='49454e44ae426082'){fs.writeFileSync('artifacts/'+name+'.png',bytes);return;}}}throw Error('Surface capture timed out');}
+try {
+ await evaluate(`demoPhoto();'loading'`);await pause(300);await evaluate(`state=defaults();normalizeEdits();history=[];future=[];setTool('crop');framePreset('free');'ready'`);await settle();
+ results.cropPresetSelection=await evaluate(`({free:document.querySelectorAll('.tool-area .chips:first-child .selected').length,labels:[...document.querySelectorAll('.tool-area .chips:first-child .selected')].map(b=>b.textContent)})`);check(results.cropPresetSelection.free===1,'Multiple frame presets selected');
+ let b=await bounds(),p=await evaluate(`(()=>{let r=document.querySelector('[data-handle="nw"]').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()`);
+ await drag(p,{x:p.x+b.width*.14,y:p.y+b.height*.11});
+ results.freeCrop=await evaluate(`cropRect()`);check(results.freeCrop.x>.1&&results.freeCrop.y>.07&&results.freeCrop.w<.9&&results.freeCrop.h<.95,'Free crop corner did not resize independently');
+ await shot('free-crop-gesture');
+ await evaluate(`framePreset(1);commit();zoomFrame(2);'zoomed'`);await settle();b=await bounds();let before=await evaluate('cropRect()');
+ await drag({x:b.x+b.width*.5,y:b.y+b.height*.5},{x:b.x+b.width*.63,y:b.y+b.height*.42});results.pan=await evaluate('cropRect()');check(Math.abs(results.pan.x-before.x)>.02&&Math.abs(results.pan.y-before.y)>.02,'Framing did not pan in both directions');
+ b=await bounds();before=await evaluate('cropRect()');const cx=b.x+b.width*.5,cy=b.y+b.height*.5;
+ await touch('touchStart',[{x:cx-40,y:cy,id:1},{x:cx+40,y:cy,id:2}]);for(let i=1;i<=10;i++)await touch('touchMove',[{x:cx-40-i*3,y:cy,id:1},{x:cx+40+i*3,y:cy,id:2}]);await touch('touchEnd',[]);await settle();
+ results.pinch=await evaluate(`({crop:cropRect(),saved:JSON.parse(localStorage.getItem('project:'+mediaPath)).crop})`);check(results.pinch.crop.w<before.w*.7,'Pinch failed to zoom');check(JSON.stringify(results.pinch.crop)===JSON.stringify(results.pinch.saved),'Pinch crop was not saved');
+ await evaluate(`setTool('text');if(!state.texts.length)addText();textChange('text','MOVE ME');'text'`);await settle();b=await bounds();let t=await evaluate('clone(selectedText())'),r=await evaluate('cropRect()');
+ p={x:b.x+(t.x-r.x)/r.w*b.width,y:b.y+(t.y-r.y)/r.h*b.height};await drag(p,{x:p.x+b.width*.15,y:p.y-b.height*.12});
+ results.textDrag=await evaluate('clone(selectedText())');check(Math.abs((results.textDrag.x-t.x)-r.w*.15)<.005&&Math.abs((results.textDrag.y-t.y)+r.h*.12)<.005,'Text did not move freely');await evaluate('undo();"undo"');check(await evaluate(`Math.abs(selectedText().x-${t.x})<.00001`),'Text move undo failed');await evaluate('redo();addText();textChange("text","LUMA");textChange("font","serif");textChange("rotation",-18);textToggle("outline");textToggle("background");"styled"');await settle();results.layers=await evaluate('state.texts.length');check(results.layers===2,'Text layers missing');await shot('movable-text-layers');
+ await evaluate(`setTool('draw');addDrawingLayer();brushMode('pen');state.brushColor='#ff3344';state.brushSize=1.8;'pen'`);await settle();b=await bounds();
+ await drag({x:b.x+b.width*.2,y:b.y+b.height*.4},{x:b.x+b.width*.8,y:b.y+b.height*.4},20);results.penPoints=await evaluate('state.strokes[0].points.length');check(results.penPoints>=15,'Pen gesture did not capture stroke');await evaluate('undo();"undo"');check(await evaluate('state.strokes.length===0'),'Stroke undo failed');await evaluate(`redo();brushMode('marker');'marker'`);await settle();b=await bounds();await drag({x:b.x+b.width*.2,y:b.y+b.height*.7},{x:b.x+b.width*.8,y:b.y+b.height*.7},18);
+ await evaluate(`brushMode('eraser');state.brushSize=5;'eraser'`);await settle();b=await bounds();await drag({x:b.x+b.width*.5,y:b.y+b.height*.2},{x:b.x+b.width*.5,y:b.y+b.height*.8},20);
+ results.eraser=await evaluate(`(()=>{let c=document.createElement('canvas');c.width=500;c.height=500;let p=c.getContext('2d');renderStrokes(p,state);let kept=p.getImageData(150,200,1,1).data[3],erased=p.getImageData(250,200,1,1).data[3];renderTo(c,500);return {kept,erased,photoAlpha:c.getContext('2d').getImageData(250,200,1,1).data[3]}})()`);check(results.eraser.kept>200&&results.eraser.erased===0&&results.eraser.photoAlpha===255,'Eraser did not remove ink while preserving media');
+ await shot('pen-marker-eraser');
+ results.transforms=await evaluate(`(()=>{let texts=JSON.stringify(state.texts),points=JSON.stringify(state.strokes),crop=clone(cropRect());for(let i=0;i<4;i++)rotateFrame();let text=selectedText();let rotateOk=Math.abs(text.x-JSON.parse(texts).at(-1).x)<1e-8&&Math.abs(text.size-JSON.parse(texts).at(-1).size)<1e-8;flipFrame('h');flipFrame('h');let flipOk=Math.abs(state.strokes[0].points[0].x-JSON.parse(points)[0].points[0].x)<1e-8;let anchor=clone(text),sourcePoint=clone(state.strokes[0].points[0]);state.crop={x:.1,y:.1,w:.8,h:.8};draw();let anchored=text.x===anchor.x&&text.y===anchor.y&&state.strokes[0].points[0].x===sourcePoint.x;return {rotateOk,flipOk,anchored}})()`);check(results.transforms.rotateOk&&results.transforms.flipOk&&results.transforms.anchored,'Annotations did not follow image transformations');
+ await evaluate(`state.crop={x:.08,y:.08,w:.84,h:.8};state.ratio=0;setTool('looks');persist();draw();'final'`);await settle();fs.writeFileSync('artifacts/direct-edit-state.json',JSON.stringify(await evaluate('state'),null,2));results.output=await evaluate('geometry(state)');
+ fs.writeFileSync('artifacts/direct-edit-results.json',JSON.stringify(results,null,2));console.log(JSON.stringify(results,null,2));
+} finally {close();}

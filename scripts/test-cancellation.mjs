@@ -1,0 +1,3 @@
+import {evaluate,close} from './cdp.mjs';import fs from 'node:fs';
+let t=Date.now();await evaluate(`state=defaults();state.end=duration;state.speed=.5;state.look='Golden';state.vignette=80;openExport();doExport();setTimeout(cancelExport,400);'started'`);
+let result;for(let i=0;i<50;i++){await new Promise(r=>setTimeout(r,100));result=await evaluate(`({busy:exporting,closed:$('exportModal').classList.contains('hidden'),toast:$('toast').textContent})`);if(!result.busy)break}result.elapsedMs=Date.now()-t;fs.writeFileSync('artifacts/cancellation.json',JSON.stringify(result,null,2));console.log(result);close();if(result.busy||!result.closed||!result.toast.includes('cancelled'))process.exitCode=1;
