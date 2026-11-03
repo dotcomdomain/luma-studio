@@ -578,8 +578,13 @@ function solve4(A, b) {
   return m.map((row, i) => row[4] / row[i]);
 }
 function videoReferenceFrame(path, t, ref) {
-  if (!ref || path !== mediaPath || mediaType !== 'video' || video.seeking ||
-      Math.abs(video.currentTime - t) > .001) return;
+  if (!ref || path !== mediaPath || mediaType !== 'video') return;
+  // The playhead moved while Java decoded: ask again for the frame now on screen.
+  if (video.seeking || Math.abs(video.currentTime - t) > .001) {
+    referenceRequest = null;
+    if (!video.seeking && video.paused) requestVideoReference();
+    return;
+  }
   // Each cell is the mean of 8 × 8 samples, as Java takes them.
   const c = document.createElement('canvas');
   c.width = ref.w * 8;
