@@ -48,11 +48,6 @@ final class VideoExporter {
     int texture;
   }
   static final class CancelledException extends Exception {}
-  // A compressed frame bigger than the hardware decoder's input buffers.
-  static final class SampleTooLargeException extends Exception {
-    final long size;
-    SampleTooLargeException(long size) { this.size = size; }
-  }
 
   // Settings, filled in by the caller.
   File source, output;
@@ -190,21 +185,7 @@ final class VideoExporter {
       this.audioReader = audioReader;
       this.audioThread = audioThread;
       try {
-        try {
-          encodeVideo(videoTrack, videoFormat, sourceRotation, sourceFps, audio, true);
-        } catch (SampleTooLargeException e) {
-          // Very detailed frames (huge keyframes) don't fit the hardware decoder's input
-          // buffers, and it can't be given bigger ones. Android's software decoder can.
-          if (muxing) throw new IOException("A frame in this video is too large for the phone's decoder.");
-          softwareDecoder = true;
-          // Room for frames somewhat larger than the one that didn't fit.
-          decoderInputSize = (int) Math.min(256L << 20, Math.max(16L << 20, e.size * 3 / 2));
-          output.delete();
-          muxer = null;
-          muxVideoTrack = muxAudioTrack = -1;
-          audioIndex = 0;
-          encodeVideo(videoTrack, videoFormat, sourceRotation, sourceFps, audio, true);
-        }
+        encodeVideo(videoTrack, videoFormat, sourceRotation, sourceFps, audio, true);
       } catch (CancelledException e) {
         throw e;
       } catch (Exception e) {
@@ -242,18 +223,8 @@ final class VideoExporter {
   // Things the person should know about a finished export (no audio, HDR); null if none.
   String audioNote, colorNote;
   private long lastMuxedVideoUs = -1;
-  private boolean softwareDecoder;
-  private int decoderInputSize;
   // 0: SDR. 1: PQ, 2: HLG; the decoder didn't tone-map, so the shader does.
   private int hdrMode;
-  static String softwareDecoderFor(String mime) throws IOException {
-    for (MediaCodecInfo info : new MediaCodecList(MediaCodecList.REGULAR_CODECS).getCodecInfos()) {
-      if (info.isEncoder() || !info.isSoftwareOnly()) continue;
-      for (String type : info.getSupportedTypes())
-        if (type.equalsIgnoreCase(mime)) return info.getName();
-    }
-    throw new IOException("A frame in this video is too large for the phone's decoder.");
-  }
   private void encodeVideo(int track, MediaFormat sourceFormat, int sourceRotation,
       double sourceFps, AudioPipeline.Result audio, boolean useProfile) throws Exception {
     this.audio = audio;
@@ -342,14 +313,12 @@ final class VideoExporter {
       }, new Handler(frameThread.getLooper()));
       decoderSurface = new Surface(texture);
       String sourceMime = sourceFormat.getString(MediaFormat.KEY_MIME);
-      decoder = softwareDecoder ? MediaCodec.createByCodecName(softwareDecoderFor(sourceMime)) :
-          MediaCodec.createDecoderByType(sourceMime);
+      decoder = MediaCodec.createDecoderByType(sourceMime);
       // The decoder would rotate the picture itself (through the texture matrix); the shader
       // already does, so the decoder is told there's nothing to rotate. A copy keeps the
       // source format intact for a retry.
       MediaFormat inFormat = new MediaFormat(sourceFormat);
       inFormat.setInteger(MediaFormat.KEY_ROTATION, 0);
-      if (softwareDecoder) inFormat.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, decoderInputSize);
       boolean hdr = isHdr(sourceFormat);
       hdrMode = 0;
       // HDR (PQ/HLG) frames would be read as SDR and look flat; ask the decoder to tone-map.
@@ -385,8 +354,13 @@ final class VideoExporter {
           if (index < 0) break;
           {
             ByteBuffer buffer = decoder.getInputBuffer(index);
+            // Frames bigger than the decoder's input buffers can't be decoded here: neither
+            // this phone's hardware decoder nor Android's software one can be given larger
+            // buffers, and both lose data when a frame is split (BUFFER_FLAG_PARTIAL_FRAME).
             if (extractor.getSampleSize() > buffer.capacity())
-              throw new SampleTooLargeException(extractor.getSampleSize());
+              throw new IOException("A frame in this video is " + Math.round(extractor.getSampleSize() / 1e6)
+                  + " MB, more than the phone's video decoder can take (" + Math.round(buffer.capacity() / 1e6)
+                  + " MB). Files like this come from lossless or near-lossless encoders.");
             int size = extractor.readSampleData(buffer, 0);
             long time = extractor.getSampleTime();
             if (size < 0 || time > endUs + 1_000_000) {
@@ -649,7 +623,8 @@ final class VideoExporter {
       + "  return texture2D(uTex, (uSt * vec4(c.x, 1.0 - c.y, 0.0, 1.0)).xy).rgb;\n"
       + "}\n"
       // HDR to SDR for decoders that can't: PQ or HLG signal (BT.2020) to light, 203 nits
-      // as SDR white (BT.2408), highlights rolled off, BT.2020 to BT.709 primaries, sRGB.
+      // as SDR white (BT.2408), BT.2020 to BT.709 primaries, highlights rolled off, then
+      // SDR video's display gamma (BT.1886, 2.4), as BT.2408 maps HDR to SDR.
       + "vec3 toSdr(vec3 e) {\n"
       + "  vec3 l;\n"
       + "  if (uHdr == 1) {\n"
@@ -662,9 +637,11 @@ final class VideoExporter {
       + "  }\n"
       + "  l = mat3(1.6605, -0.1246, -0.0182, -0.5876, 1.1329, -0.1006, -0.0728, -0.0083, 1.1187) * l;\n"
       + "  l = max(l, 0.0);\n"
+      // Up to 80% of SDR white stays as it is; above, the brightest channel rolls off
+      // smoothly towards white (1000-nit highlights end up at about 99%).
       + "  float m = max(max(l.r, l.g), l.b);\n"
-      + "  if (m > 0.75) l *= (0.75 + 0.25 * (1.0 - exp(-(m - 0.75) / 0.25 * 1.0)) ) / m;\n"
-      + "  return mix(l * 12.92, 1.055 * pow(l, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, l));\n"
+      + "  if (m > 0.8) l *= (0.8 + 0.2 * (m - 0.8) / (m - 0.6)) / m;\n"
+      + "  return pow(l, vec3(1.0 / 2.4));\n"
       + "}\n"
       // A downscale averages a grid of uTaps × uTaps bilinear samples spread over the
       // output pixel, so every source pixel under it counts.
