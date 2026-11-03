@@ -91,12 +91,8 @@ python scripts/virtual-display.py stop
 
 While it is running, create `artifacts/capture.request` and make an edit to save an actual surface screenshot to `artifacts/display.png`. Chromium's screenshot API can omit accelerated video canvas content; use the surface capture to verify video visuals.
 
-`scripts/startup-profile.sh` records three process-cold launches on the virtual display and forwards WebView DevTools to localhost:9222. `scripts/profile.mjs` measures repeated adjustment rendering and animation-frame intervals. `scripts/test-export.mjs` runs the photo, graded-video, and muted-video integration cases after opening the appropriate fixture. Results and media probes are retained in `artifacts/`; see the [profiling report](artifacts/profile-summary.md).
+`scripts/startup-profile.sh` records three process-cold launches on the virtual display and forwards WebView DevTools to localhost:9222. `scripts/profile.mjs` measures repeated adjustment rendering and animation-frame intervals. `scripts/probe-latest.sh` prints the streams of the newest export and `scripts/compare-export.sh` compares it with the preview; `scripts/analysis/` has the frame and audio checks used on exports. Test output isn't kept in the repo: delete test exports from the gallery when done.
 
-## Review
-
-The video timing update is verified with real touch interactions and decoded output frames; see [timing validation](artifacts/video-timing-validation.md).
-
-After the interface cleanup, the two GPT-6.1 Terra reviewers scored the app **8.7/10 for UI** and **9/10 for feature completeness**. The review included the actual offscreen display capture and verified saved photo/video outputs.
+## Credits
 
 The bundled alpine photograph is from [Unsplash](https://images.unsplash.com/photo-1470770841072-f978cf4d019e); the sample motion clip is generated from that photograph with a synthesized tone. Photo asset: https://images.unsplash.com/photo-1470770841072-f978cf4d019e . Interface icons are hand-authored SVG paths.

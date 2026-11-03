@@ -1,7 +1,2 @@
 build/
-artifacts/*.idsig
-artifacts/*.mp4
-artifacts/*.jpg
-artifacts/*.webp
-artifacts/Luma-*
-artifacts/luma-studio.apk
+artifacts/*
