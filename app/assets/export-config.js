@@ -3,13 +3,13 @@ const exportDropdowns = new Map(), exportHelpOpen = new Set();
 let exportPhotoFormatExplicit = false, pendingPhotoTransparencyRefresh = false;
 function exportDefaults() {
   return {preset: 'balanced', codec: 'h264', crf: 23, fps: 0, fpsCap30: false,
-    rateMode: 'quality', bitrate: 8, bitrateAutomatic: true, encoding: 'veryfast',
+    rateMode: 'quality', bitrate: 8, bitrateAutomatic: true,
     preferredPhotoFormat: null,
     audioBitrate: 192, channels: 0, sampleRate: 0, fastStart: true, name: ''};
 }
 const exportEnums = {
   codec: ['h264', 'hevc'], crf: [18, 20, 23, 28], fps: [0, 24, 25, 30, 50, 60],
-  rateMode: ['quality', 'bitrate'], encoding: ['ultrafast', 'veryfast', 'fast'],
+  rateMode: ['quality', 'bitrate'],
   audioBitrate: [96, 128, 192, 256], channels: [0, 1, 2], sampleRate: [0, 44100, 48000]
 };
 function initializeExportSettings() {
@@ -22,7 +22,7 @@ function initializeExportSettings() {
   exportSize = 0;
   quality = .9;
   try {
-    const saved = JSON.parse(localStorage.getItem('export-settings:' + mediaType) || '{}');
+    const saved = JSON.parse(readSetting('export-settings:' + mediaType) || '{}');
     for (const [key, options] of Object.entries(exportEnums))
       if (options.includes(saved[key])) exportConfig[key] = saved[key];
     if (['quality', 'balanced', 'small', 'custom'].includes(saved.preset)) exportConfig.preset = saved.preset;
@@ -33,8 +33,6 @@ function initializeExportSettings() {
         saved.bitrateAutomatic : saved.rateMode !== 'bitrate';
     const preferred = saved.schema >= 2 ? saved.preferredPhotoFormat : saved.format;
     if (['jpg', 'png', 'webp'].includes(preferred)) exportConfig.preferredPhotoFormat = preferred;
-    if ((!saved.schema || saved.schema < 2) && saved.preset !== 'custom')
-      exportConfig.encoding = 'veryfast';
     if (Number.isFinite(saved.bitrate)) exportConfig.bitrate = clamp(saved.bitrate, .2, 100);
     // A pixel size belongs to the file it was chosen for. Other files get the preset's size.
     if (Number.isFinite(saved.size) && saved.sizePath === mediaPath)
@@ -51,7 +49,7 @@ function initializeExportSettings() {
     if (exportSize >= Math.max(g.cw, g.ch)) exportSize = 0;
   }
   if (mediaType === 'photo') {
-    const specific = localStorage.getItem('export-format:' + mediaPath);
+    const specific = readSetting('export-format:' + mediaPath);
     exportPhotoFormatExplicit = ['jpg', 'png', 'webp'].includes(specific);
     exportFormat = exportPhotoFormatExplicit ? specific : automaticPhotoFormat();
   }
@@ -99,9 +97,8 @@ function useSuggestedBitrate() {
 }
 function saveExportPreferences() {
   const {name, ...config} = exportConfig;
-  localStorage.setItem('export-settings:' + mediaType,
-      JSON.stringify({...config, schema: 2, size: exportSize, sizePath: mediaPath, quality,
-        format: exportFormat}));
+  storeSetting('export-settings:' + mediaType,
+      JSON.stringify({...config, schema: 2, size: exportSize, sizePath: mediaPath, quality}));
 }
 function setExportPreset(preset) {
   if (exporting || !['quality', 'balanced', 'small'].includes(preset)) return;
@@ -114,7 +111,6 @@ function setExportPreset(preset) {
     quality = preset === 'quality' ? .95 : preset === 'balanced' ? .9 : .75;
   } else {
     exportConfig.crf = preset === 'quality' ? 20 : preset === 'balanced' ? 23 : 28;
-    exportConfig.encoding = 'veryfast';
     exportConfig.audioBitrate = preset === 'small' ? 96 : 192;
     exportConfig.fpsCap30 = preset === 'small';
     exportConfig.fps = exportConfig.fpsCap30 && sourceVideoFps > 30.01 ? 30 : 0;
@@ -132,7 +128,7 @@ function setExportOption(key, value) {
     exportFormat = value;
     exportPhotoFormatExplicit = true;
     exportConfig.preferredPhotoFormat = value;
-    localStorage.setItem('export-format:' + mediaPath, value);
+    storeSetting('export-format:' + mediaPath, value);
   } else if (key === 'size') {
     if (value === 'custom') {
       const g = geometry(state);
@@ -172,7 +168,7 @@ function setPhotoExportQuality(value) {
   quality = clamp(+value / 100, .5, 1);
   exportConfig.preset = 'custom';
   $('exportQualityValue').value = Math.round(quality * 100) + '%';
-  document.querySelectorAll('.export-presets .chip').forEach(b => b.classList.remove('selected'));
+  showCustomPreset();
   saveExportPreferences();
   updateExportSummary();
 }
@@ -184,6 +180,7 @@ function setExportBitrate(value) {
   exportConfig.bitrate = +value;
   exportConfig.bitrateAutomatic = false;
   exportConfig.preset = 'custom';
+  showCustomPreset();
   saveExportPreferences();
   updateExportSummary();
 }
@@ -199,8 +196,21 @@ function setExportFastStart(value) {
   if (exporting) return;
   exportConfig.fastStart = value;
   exportConfig.preset = 'custom';
-  document.querySelectorAll('.export-presets .chip').forEach(b => b.classList.remove('selected'));
+  showCustomPreset();
   saveExportPreferences();
+}
+// Settings changed by hand leave the presets; a line under them says so.
+function presetChips() {
+  return [['quality', 'High quality'], ['balanced', 'Balanced'], ['small', 'Small file']]
+      .map(([key, label]) => chip(label, exportConfig.preset === key, `setExportPreset('${key}')`)).join('');
+}
+function presetNote() {
+  return `<p id="presetNote" class="preset-note" ${exportConfig.preset === 'custom' ? '' : 'hidden'}>Custom settings. Tap a preset to go back to it.</p>`;
+}
+function showCustomPreset() {
+  const row = document.querySelector('.export-presets');
+  if (row) row.innerHTML = presetChips();
+  if ($('presetNote')) $('presetNote').hidden = exportConfig.preset !== 'custom';
 }
 function exportEscape(value) {
   return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
@@ -235,6 +245,10 @@ function openExportDropdown(id, focusEnd = false) {
   if (!config || !trigger || trigger.disabled || exporting) return;
   if (!config.onChoose && $('exportModal').classList.contains('hidden')) return;
   closeExportDropdown(false);
+  // The menu lives inside the dialog it belongs to, so TalkBack (which only reads the
+  // modal export sheet while it's open) can reach it.
+  const host = config.onChoose ? document.body : document.querySelector('.export-sheet');
+  if ($('exportDropdownLayer').parentElement !== host) host.appendChild($('exportDropdownLayer'));
   exportDropdown = {...config, typeahead: '', typedAt: 0};
   const menu = $('exportDropdownMenu');
   menu.setAttribute('aria-labelledby', id + 'Label');
@@ -352,7 +366,7 @@ function renderExport() {
       (n === exportSize && !exportConfig.customSize && n < source));
   if (exportSize && !standardSizes.includes(exportSize)) exportConfig.customSize = true;
   let content = '<fieldset id="exportFields" class="export-fields">' +
-      '<div class="chips export-presets">' + [['quality', 'High quality'], ['balanced', 'Balanced'], ['small', 'Small file']].map(([key, label]) => chip(label, exportConfig.preset === key, `setExportPreset('${key}')`)).join('') + '</div>';
+      '<div class="chips export-presets" role="group" aria-label="Presets">' + presetChips() + '</div>' + presetNote();
   if (photo) {
     content += exportSelect('exportFormat', 'Format', exportFormat,
         [['jpg', 'JPEG'], ['png', 'PNG · lossless'], ['webp', 'WebP']], 'format');
@@ -410,9 +424,31 @@ function updateExportSummary() {
   const dimensions = exportOutputDimensions();
   let info = exportFormat === 'jpg' ? 'JPEG' : exportFormat.toUpperCase();
   if (mediaType === 'video') info = time((state.end - state.start) / state.speed) + ' · ' +
-      (exportConfig.codec === 'hevc' ? 'HEVC' : 'H.264') + (exportConfig.fps ? ' · ' + exportConfig.fps + ' fps' : '');
+      (exportConfig.codec === 'hevc' ? 'HEVC' : 'H.264') + (exportConfig.fps ? ' · ' + exportConfig.fps + ' fps' : '') +
+      ' · about ' + formatSize(estimatedVideoBytes());
   else if (exportFormat !== 'png') info += ' · ' + Math.round(quality * 100) + '%';
   $('exportSummary').innerHTML = `<span>${dimensions.join(' × ')}</span><span>${info}</span>`;
+}
+// The video exporter's own bitrate rules (VideoExporter.encodeVideo and
+// MainActivity.videoJob), so the estimate matches what the encoder is asked for.
+function estimatedVideoBytes() {
+  const [w, h] = exportOutputDimensions(), seconds = (state.end - state.start) / state.speed,
+        source = sourceVideoFps || 30, arrival = source * state.speed,
+        grid = exportConfig.fps || (state.speed > 1 ? source : 0),
+        fps = Math.max(1, Math.round(grid ? Math.min(grid, arrival) : arrival));
+  let video;
+  if (exportConfig.rateMode === 'bitrate') video = exportConfig.bitrate * 1e6;
+  else {
+    const bpp = {18: .2, 20: .15, 23: .1, 28: .06}[exportConfig.crf] * (exportConfig.codec === 'hevc' ? .65 : 1);
+    video = clamp(w * h * fps * bpp, 5e5, 1e8);
+  }
+  const audio = state.mute ? 0 : exportConfig.audioBitrate * 1000;
+  return (video + audio) * seconds / 8;
+}
+function formatSize(bytes) {
+  if (bytes >= 1e9) return (bytes / 1e9).toFixed(1) + ' GB';
+  if (bytes >= 1e7) return Math.round(bytes / 1e6) + ' MB';
+  return Math.max(.1, bytes / 1e6).toFixed(1) + ' MB';
 }
 // The phone's encoders, asked once. HEVC is only offered when the phone has one.
 let cachedVideoEncoders = null;

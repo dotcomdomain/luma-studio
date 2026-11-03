@@ -124,8 +124,10 @@ function closeColorPicker(apply = false, restoreFocus = true) {
   if (object) {
     object[key] = session.original;
     if (apply && session.value !== session.original) {
-      commit();
+      // A text color is an edit (one undo step); the brush color is a tool setting.
+      if (session.target !== 'brush') commit();
       object[key] = session.value;
+      if (session.target === 'brush') rememberBrushConfig();
       persist();
     }
   }

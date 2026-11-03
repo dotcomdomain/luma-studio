@@ -77,12 +77,14 @@ function hideBusy() {
   $('busy').classList.add('hidden');
 }
 let importName = '';
+// During an export the file is copied quietly; it opens once the export is done, and the
+// overlay would cover the export's progress and Cancel button.
 function importStarted(name) {
   importName = name;
-  showBusy('Opening ' + name.replace(/\.[^.]+$/, '') + '…');
+  if (!exporting) showBusy('Opening ' + name.replace(/\.[^.]+$/, '') + '…');
 }
 function importProgress(n) {
-  showBusy('Opening ' + importName.replace(/\.[^.]+$/, '') + '… ' + n + '%');
+  if (!exporting) showBusy('Opening ' + importName.replace(/\.[^.]+$/, '') + '… ' + n + '%');
 }
 function importFailed(message) {
   hideBusy();
@@ -111,14 +113,16 @@ function loadMedia(path, type, name, resume = false, external = false) {
   const afterImport = !$('busy').classList.contains('hidden');
   hideBusy();
   if (exporting) return;
+  // An open color sheet previews its color in the state; it's cancelled before that state
+  // is saved with the project's history.
+  if (colorSession) closeColorPicker(false, false);
+  cancelTimingInteraction();
+  closeExportDropdown(false);
   rememberHistory();
   flushProject();
   releasePreviewImage();
   sessionExternal = external;
   hideExportModal();
-  cancelTimingInteraction();
-  closeExportDropdown(false);
-  if (colorSession) closeColorPicker(false, false);
   const sequence = ++mediaLoadSequence;
   cancelPhotoTransparencyProbe();
   sourceVideoFps = 0;
@@ -133,20 +137,15 @@ function loadMedia(path, type, name, resume = false, external = false) {
   state = defaults();
   if (resume) {
     try {
-      state = {
-        ...state,
-        ...JSON.parse(localStorage.getItem('project:' + path) || '{}'),
-        annotationSpace:
-            JSON.parse(localStorage.getItem('project:' + path) || '{}')
-                .annotationSpace ||
-            1
-      }
+      const saved = JSON.parse(localStorage.getItem('project:' + path) || '{}');
+      if (saved && typeof saved === 'object')
+        state = {...state, ...saved, annotationSpace: saved.annotationSpace || 1};
     } catch (e) {
     }
   }
   history = [];
   future = [];
-  pendingSnapshot = null;
+  pendingSnapshot = pendingEdits = null;
   // Reopening a project from this session brings its undo history back, as long as the
   // saved project hasn't changed since.
   const kept = resume && sessionHistories.get(path);
@@ -206,7 +205,7 @@ function loadMedia(path, type, name, resume = false, external = false) {
       // Once the preview copy exists, the full-resolution decode isn't needed until an
       // export; releasing it saves width × height × 4 bytes (48 MB for 12 MP).
       Promise.all([previewReady, photoTransparencyTask]).then(() => {
-        if (current() && previewImage) releaseFullImage();
+        if (current() && previewImage && !exporting) releaseFullImage();
       });
     };
     image.onerror = () => failed('This photo format could not be opened');
@@ -248,6 +247,14 @@ function ensureFullImage() {
     image.src = mediaPath;
   });
 }
+// The preview copy is enough for a render only if it has at least as many pixels across
+// the crop as the render needs. A zoomed-in crop needs the full image even for a small
+// export.
+function previewCopyEnough(max, s = state) {
+  if (!previewImage || !nativeW) return false;
+  const g = geometry(s), scale = Math.min(1, max / Math.max(g.cw, g.ch));
+  return scale <= previewImage.width / nativeW + 1e-6;
+}
 function releasePreviewImage() {
   previewImage?.close?.();
   previewImage = null;
@@ -278,21 +285,39 @@ function ready() {
 }
 // commit() marks the state before an edit. The mark becomes an undo step only once the
 // state really differs, so a tap that changes nothing keeps Redo and the history intact.
-let pendingSnapshot = null;
-function settleHistory(json = JSON.stringify(state)) {
-  if (pendingSnapshot === null || pendingSnapshot === json) return;
+// The brush settings and which layer is selected are tool settings, not edits: changing
+// them is never an undo step, and undo leaves them as they are.
+const toolSettingKeys = ['brushMode', 'brushColor', 'brushSize', 'brushOpacity', 'brushConfigs',
+  'activeTextId', 'activeDrawingId'];
+const editsJSON = s => JSON.stringify(s, function(key, value) {
+  return this === s && toolSettingKeys.includes(key) ? undefined : value;
+});
+let pendingSnapshot = null, pendingEdits = null;
+function settleHistory() {
+  if (pendingSnapshot === null || pendingEdits === editsJSON(state)) return;
   history.push(JSON.parse(pendingSnapshot));
   if (history.length > 50) history.shift();
   future = [];
-  pendingSnapshot = null;
+  pendingSnapshot = pendingEdits = null;
   updateHistory();
+}
+// Undo and redo swap in another version of the edits but keep the current tool settings
+// (and the selected layers, while they still exist).
+function restoreEdits(next) {
+  const current = state;
+  state = next;
+  for (const key of ['brushMode', 'brushColor', 'brushSize', 'brushOpacity', 'brushConfigs'])
+    state[key] = current[key];
+  if (state.texts?.some(t => t.id === current.activeTextId)) state.activeTextId = current.activeTextId;
+  if (state.drawingLayers?.some(l => l.id === current.activeDrawingId))
+    state.activeDrawingId = current.activeDrawingId;
 }
 // Undo history survives leaving the editor and reopening a project, for this session.
 const sessionHistories = new Map();
 function rememberHistory() {
   if (!mediaPath || !state || !isImportedPath(mediaPath)) return;
   settleHistory();
-  pendingSnapshot = null;
+  pendingSnapshot = pendingEdits = null;
   flushProject();
   sessionHistories.set(mediaPath, {history, future, state: JSON.stringify(state),
     saved: localStorage.getItem('project:' + mediaPath)});
@@ -317,12 +342,23 @@ function flushProject() {
   try {
     localStorage.setItem('project:' + path, JSON.stringify(state));
     localStorage.setItem('edited:' + path, String(Date.now()));
+    storageWarned = false;
   } catch (_) {
     if (!storageWarned) toast('Storage is full, so recent edits may not be saved');
     storageWarned = true;
   }
 }
 document.addEventListener('visibilitychange', () => { if (document.hidden) flushProject(); });
+// Settings that are only nice to keep (export choices, hints) fail quietly when storage is
+// full; the setting still applies for this session.
+const settingsThisSession = new Map();
+function storeSetting(key, value) {
+  settingsThisSession.set(key, value);
+  try { localStorage.setItem(key, value); return true; } catch (_) { return false; }
+}
+function readSetting(key) {
+  return settingsThisSession.has(key) ? settingsThisSession.get(key) : localStorage.getItem(key);
+}
 function timeAgo(t) {
   const minutes = Math.round((Date.now() - t) / 60000);
   if (minutes < 1) return 'just now';
@@ -347,6 +383,7 @@ function pruneSavedProjects(projects) {
     const key = localStorage.key(i), m = /^(project|edited|export-format):(.*)$/.exec(key || '');
     if (m && !keep.has(m[2])) localStorage.removeItem(key);
   }
+  for (const path of sessionHistories.keys()) if (!keep.has(path)) sessionHistories.delete(path);
 }
 function renderHome() {
   const projects = recentProjects();
@@ -386,6 +423,7 @@ function showRecentThumbnail(path, url) {
 function commit() {
   settleHistory();
   pendingSnapshot = JSON.stringify(state);
+  pendingEdits = editsJSON(state);
 }
 function change(key, value) {
   commit();
@@ -400,18 +438,18 @@ function updateHistory() {
 }
 function undo() {
   settleHistory();
-  pendingSnapshot = null;
+  pendingSnapshot = pendingEdits = null;
   if (!history.length) return;
   future.push(clone(state));
-  state = history.pop();
+  restoreEdits(history.pop());
   afterHistory()
 }
 function redo() {
   settleHistory();
-  pendingSnapshot = null;
+  pendingSnapshot = pendingEdits = null;
   if (!future.length) return;
   history.push(clone(state));
-  state = future.pop();
+  restoreEdits(future.pop());
   afterHistory()
 }
 function afterHistory() {
@@ -424,12 +462,18 @@ function afterHistory() {
   renderTool()
 }
 function resetEdit() {
+  const before = editsJSON(state);
   commit();
+  const tools = state;
   state = defaults();
+  for (const key of ['brushMode', 'brushColor', 'brushSize', 'brushOpacity', 'brushConfigs'])
+    state[key] = tools[key];
   state.end = duration;
   normalizeEdits();
+  normalizeTimings();
   persist();
   afterHistory();
+  if (editsJSON(state) !== before) toast('All edits removed. Undo brings them back');
 }
 function params(s) {
   const l = looks.find(l => l[0] === s.look) || looks[0];
@@ -478,8 +522,10 @@ function geometry(s) {
 const previewBase = {canvas: document.createElement('canvas'), key: ''};
 function renderTo(target, max, original = false, viewState = state, background = null) {
   if (!nativeW || !nativeH) return;
+  // Exports never upscale. The on-screen canvas does, so a zoomed-in crop of a small
+  // picture still fills the preview (and doesn't shrink under the fingers while pinching).
   let s = original ? defaults() : viewState, g = geometry(s),
-      scale = Math.min(1, max / Math.max(g.cw, g.ch));
+      scale = target === canvas ? max / Math.max(g.cw, g.ch) : Math.min(1, max / Math.max(g.cw, g.ch));
   let tw = Math.max(2, Math.round(g.cw * scale)),
       th = Math.max(2, Math.round(g.ch * scale));
   if (target.width !== tw) target.width = tw;
@@ -491,7 +537,7 @@ function renderTo(target, max, original = false, viewState = state, background =
     c.fillRect(0, 0, tw, th);
   }
   const source = mediaType !== 'photo' ? video :
-      previewImage && (max <= PREVIEW_EDGE || fullImageReleased) ? previewImage : image;
+      previewImage && (fullImageReleased || previewCopyEnough(max, s)) ? previewImage : image;
   const cacheable = target === canvas && !background &&
       (mediaType === 'photo' || (video.paused && !video.seeking));
   const key = cacheable ? [mediaPath, tw, th, s.rotation, s.flip, s.flipY, g.x, g.y, g.cw, g.ch,
@@ -605,13 +651,18 @@ video.addEventListener('loadeddata', () => {
   draw();
   if (tool === 'looks') renderTool();
 });
+function syncPlayButton() {
+  const playing = !video.paused;
+  document.querySelector('#timeline use').setAttribute('href', playing ? '#pause' : '#play');
+  $('playButton').setAttribute('aria-label', playing ? 'Pause' : 'Play');
+}
 video.addEventListener('play', () => {
   startVideoFrames();
-  document.querySelector('#timeline use').setAttribute('href', '#pause');
+  syncPlayButton();
   requestAnimationFrame(animateVideo);
 });
 video.addEventListener('pause', () => {
-  document.querySelector('#timeline use').setAttribute('href', '#play');
+  syncPlayButton();
   draw();
 });
 function togglePlay() {
@@ -639,24 +690,35 @@ $('preview').addEventListener('click', () => {
   const willPlay = video.paused;
   togglePlay();
   flashPlayState(willPlay);
+  markHintSeen('play');
 });
 function time(n) {
   return `${Math.floor(n / 60)}:${String(Math.floor(n % 60)).padStart(2, '0')}`
 }
+function setComparing(on) {
+  comparing = on;
+  $('compareButton').setAttribute('aria-pressed', String(on));
+  draw();
+}
+let comparePointerUsed = false;
 $('compareButton').addEventListener('contextmenu', e => e.preventDefault());
 $('compareButton').addEventListener('pointerdown', e => {
   e.preventDefault();
+  comparePointerUsed = true;
   $('compareButton').setPointerCapture(e.pointerId);
-  comparing = true;
-  $('compareButton').setAttribute('aria-pressed', 'true');
-  draw()
+  setComparing(true);
 });
 for (let event of ['pointerup', 'pointercancel', 'lostpointercapture'])
   $('compareButton').addEventListener(event, () => {
-    comparing = false;
-    $('compareButton').setAttribute('aria-pressed', 'false');
-    draw()
+    if (comparing) setComparing(false);
   });
+// A click with no finger on the button comes from a keyboard or an accessibility
+// service (TalkBack's double tap), which can't hold; there it switches the original on
+// and off instead.
+$('compareButton').addEventListener('click', () => {
+  if (comparePointerUsed) { comparePointerUsed = false; return; }
+  setComparing(!comparing);
+});
 // Restarts a one-shot CSS animation class on an element.
 function replayAnimation(el, cls) {
   if (!el) return;
@@ -669,8 +731,11 @@ function setTool(t) {
   prepareTool(t);
   const switched = tool !== t;
   tool = t;
-  document.querySelectorAll('[data-tool]')
-      .forEach(b => b.classList.toggle('active', b.dataset.tool === t));
+  document.querySelectorAll('.tool-nav [data-tool]').forEach(b => {
+    b.classList.toggle('active', b.dataset.tool === t);
+    b.setAttribute('aria-pressed', String(b.dataset.tool === t));
+  });
+  if (comparing && switched) setComparing(false);
   renderTool();
   if (switched) replayAnimation($('toolContent'), 'tool-enter');
   draw();
@@ -728,13 +793,12 @@ function slide(k, v) {
         ?.classList.toggle('modified', +v !== 0);
     syncAdjustResets();
   }
-  if (k === 'volume') video.volume = Math.min(1, +v);
   persist();
   draw()
 }
 function chip(label, selected, call, extra = '') {
-  return `<button class="chip ${selected ? 'selected' : ''} ${extra}" onclick="${
-      call}">${label}</button>`
+  return `<button class="chip ${selected ? 'selected' : ''} ${extra}" aria-pressed="${
+      !!selected}" onclick="${call}">${label}</button>`
 }
 // Looks previews use the photo itself, or a still of the current video frame.
 let lookFrame = {key: '', url: ''};
@@ -771,7 +835,7 @@ function renderTool() {
               let s = {...defaults(), look: l[0]};
               return `<button class="look ${
                   state.look === l[0] ? 'selected' :
-                                        ''}" onclick="change('look','${
+                                        ''}" aria-pressed="${state.look === l[0]}" onclick="change('look','${
                   l[0]}')"><span class="look-image"><img src="${
                   lookThumbnail()}" style="filter:${
                   cssFilter(s)}" alt="${l[0]} look">${
@@ -953,6 +1017,9 @@ async function doExport() {
   closeExportDropdown(false);
   exporting = true;
   exportFinishing = false;
+  exportStartedAt = performance.now();
+  exportProgressShown = -1;
+  Native.keepScreenOn?.(true);
   $('cancelExport').disabled = false;
   $('saveButton').disabled = true;
   $('saveButton').textContent = 'Preparing…';
@@ -963,7 +1030,7 @@ async function doExport() {
     if (mediaType === 'photo') {
       await photoTransparencyTask;
       const target = exportSize || Math.max(nativeW, nativeH);
-      if (target > PREVIEW_EDGE) await ensureFullImage();
+      if (!previewCopyEnough(target)) await ensureFullImage();
       await new Promise(r => setTimeout(r, 60));
       let output = document.createElement('canvas');
       // JPEG has no transparency; without a fill, transparent areas would encode as black.
@@ -976,6 +1043,7 @@ async function doExport() {
       if (blob.type !== 'image/' + (exportFormat === 'jpg' ? 'jpeg' : exportFormat))
         throw new Error('This image format is unavailable');
       output.width = output.height = 0;
+      directInkCaches.clear();
       if (previewImage) releaseFullImage();
       await sendPhoto(blob);
       Native.photoFinish(exportFormat, exportConfig.name);
@@ -993,9 +1061,12 @@ async function doExport() {
         overlay: videoOverlay(),
         drawingLayers: videoDrawingLayers(),
         textOverlay: videoTextOverlay()
-      }))
+      }));
+      // The full-size ink canvases made for the overlays aren't needed again.
+      directInkCaches.clear();
     }
   } catch (e) {
+    directInkCaches.clear();
     exportError('Could not create this export. ' + e.message)
   }
 }
@@ -1049,20 +1120,35 @@ function videoGeometry() {
     contrast: 1 + p.c / 100, saturation: 1 + p.sat / 100
   };
 }
+let exportStartedAt = 0, exportProgressShown = -1;
 function exportProgress(n) {
   $('saveButton').textContent = `Saving… ${n}%`;
   $('saveButton').classList.add('save-progress');
-  $('saveButton').style.setProperty('--progress', n + '%')
+  $('saveButton').style.setProperty('--progress', n + '%');
+  // Time left, once there's enough of the export to judge by. Screen readers hear it
+  // through the status line, in steps of 10%.
+  const elapsed = (performance.now() - exportStartedAt) / 1000;
+  if (n >= 5 && elapsed > 2) {
+    const left = Math.max(1, Math.round(elapsed * (100 - n) / n));
+    const text = left < 60 ? `About ${left < 10 ? left : Math.ceil(left / 5) * 5} s left` :
+        `About ${Math.ceil(left / 60)} min left`;
+    if (Math.floor(n / 10) !== exportProgressShown) {
+      exportProgressShown = Math.floor(n / 10);
+      $('exportStatus').textContent = text;
+    }
+  }
 }
 // Once the file is being copied into the gallery, Cancel no longer applies.
 let exportFinishing = false;
 function exportFinalizing() {
   exportFinishing = true;
+  $('exportStatus').textContent = 'Saving to the gallery…';
   $('saveButton').textContent = 'Finishing…';
   $('cancelExport').classList.add('hidden');
 }
 function exportDone(note = '') {
   exporting = false;
+  Native.keepScreenOn?.(false);
   if (pendingImport) {
     toast('Saved to gallery');
     openPendingImport();
@@ -1080,6 +1166,7 @@ function exportDone(note = '') {
 }
 function exportError(message) {
   exporting = false;
+  Native.keepScreenOn?.(false);
   $('saveButton').disabled = false;
   $('saveButton').innerHTML = icon('download') + 'Try again';
   $('saveButton').classList.remove('save-progress');
@@ -1100,6 +1187,7 @@ function cancelExport() {
 }
 function exportCancelled() {
   exporting = false;
+  Native.keepScreenOn?.(false);
   $('cancelExport').disabled = false;
   $('exportOptions').style.pointerEvents = '';
   hideExportModal();

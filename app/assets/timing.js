@@ -43,12 +43,10 @@ function timeRangeControls(scope) {
       name} time range"><div class="time-range-rail"><div class="time-range-background"></div><div class="time-range-shade before"></div><div class="time-range-shade after"></div><div class="time-range-selection"></div><i class="time-range-playhead"></i><button class="time-range-handle start" data-range-handle="start" role="slider" aria-label="${
       name} start time" aria-valuemin="0" aria-valuemax="${
       duration}" aria-valuenow="${
-      range
-          .start}" tabindex="0"><span></span></button><button class="time-range-handle end" data-range-handle="end" role="slider" aria-label="${
+      range.start.toFixed(2)}" aria-valuetext="${formatPreciseTime(range.start)}" tabindex="0"><span></span></button><button class="time-range-handle end" data-range-handle="end" role="slider" aria-label="${
       name} end time" aria-valuemin="0" aria-valuemax="${
       duration}" aria-valuenow="${
-      range
-          .end}" tabindex="0"><span></span></button></div></div><div class="time-fields"><label>Start (seconds)<input class="field" data-time-field="start" data-time-scope="${
+      range.end.toFixed(2)}" aria-valuetext="${formatPreciseTime(range.end)}" tabindex="0"><span></span></button></div></div><div class="time-fields"><label>Start (seconds)<input class="field" data-time-field="start" data-time-scope="${
       scope}" aria-label="${
       name} start in seconds" type="number" min="0" max="${
       duration}" step=".01" value="${
@@ -283,6 +281,7 @@ function armPrecisionHold(g, event, eligible) {
     const start = clamp(Math.round((value - value / duration * span) * 100) / 100, 0, duration - span);
     g.zoom = {start, end: start + span};
     g.target.classList.add('precision-active');
+    markHintSeen('trim');
     if (g.kind === 'scrub') {
       $('scrub').min = start;
       $('scrub').max = start + span;

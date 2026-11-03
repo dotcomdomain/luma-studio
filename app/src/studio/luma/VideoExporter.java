@@ -323,18 +323,14 @@ final class VideoExporter {
       muxer = new MediaMuxer(output.toString(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
       MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
       long endUs = startUs + durationUs, outputEndUs = Math.round(durationUs / speed);
-      // With a fixed output rate, output frames sit on a grid: each grid slot takes the
-      // first source frame that lands in it, and gets the slot's exact timestamp.
-      double frameStepUs = gridFps > 0 ? 1e6 / gridFps : 0;
-      // How long one source frame stays on screen, in output time. A drawing layer shows on
-      // every frame the preview would show it on: any frame whose time on screen overlaps
-      // the layer's interval.
-      long frameSpanUs = Math.max(1, Math.round(1e6 / sourceFps / speed));
-      long lastSlot = -1, lastOutUs = -1;
+      frameStepUs = gridFps > 0 ? 1e6 / gridFps : 0;
+      lastSlot = -1;
+      lastOutUs = -1;
       boolean inputDone = false, decoderDone = false, encoderDone = false;
-      // The newest frame before the trim start sits in the texture: the preview shows it at
-      // the start point, so it becomes the first output frame.
-      boolean heldFrame = false;
+      // Each decoded frame waits in the texture until the next one arrives: only then is it
+      // known how long it stays on screen, and so which output time (or grid slot) it
+      // fills. heldPts is its source time, or MIN_VALUE when the texture holds nothing.
+      long heldPts = Long.MIN_VALUE;
       long lastEncoderOutput = System.currentTimeMillis();
       float[] st = new float[16];
       while (!encoderDone) {
@@ -394,30 +390,15 @@ final class VideoExporter {
           progress = true;
           boolean end = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
           long pts = info.presentationTimeUs;
-          boolean inRange = info.size > 0 && pts >= startUs && pts < endUs;
-          boolean beforeStart = info.size > 0 && pts < startUs;
-          if (inRange && heldFrame && pts > startUs) {
-            // The held frame covers the gap between the trim start and this frame.
-            gl.draw(st, 0, frameSpanUs);
-            gl.present(0);
-            lastSlot = 0;
-            lastOutUs = 0;
+          boolean finished = end || (info.size > 0 && pts >= endUs);
+          // The held frame is on screen until this one (or the end of the trim).
+          if (heldPts != Long.MIN_VALUE && (info.size > 0 || end)) {
+            emit(gl, st, heldPts, info.size > 0 ? Math.min(pts, endUs) : endUs);
+            heldPts = Long.MIN_VALUE;
           }
-          heldFrame = false;
-          long sourceOutUs = Math.round((pts - startUs) / speed), outUs = sourceOutUs;
-          boolean keep = inRange;
-          if (keep && frameStepUs > 0) {
-            long slot = (long) Math.floor((outUs + frameStepUs * .25) / frameStepUs);
-            keep = slot > lastSlot;
-            if (keep) {
-              lastSlot = slot;
-              outUs = Math.round(slot * frameStepUs);
-            }
-          } else if (keep && lastOutUs >= 0 && outUs <= lastOutUs) {
-            keep = false;
-          }
-          decoder.releaseOutputBuffer(d, keep || beforeStart);
-          if (keep || beforeStart) {
+          boolean keep = info.size > 0 && pts < endUs;
+          decoder.releaseOutputBuffer(d, keep);
+          if (keep) {
             synchronized (frameLock) {
               long deadline = System.currentTimeMillis() + 5000;
               while (!frameReady[0]) {
@@ -429,15 +410,12 @@ final class VideoExporter {
             }
             texture.updateTexImage();
             texture.getTransformMatrix(st);
+            heldPts = pts;
           }
-          if (beforeStart) heldFrame = true;
-          if (keep) {
-            lastOutUs = outUs;
-            // Overlays follow the frame's own time, not the grid slot it was moved to.
-            gl.draw(st, sourceOutUs, frameSpanUs);
-            gl.present(outUs * 1000);
-          }
-          if (end || pts >= endUs) {
+          if (finished) {
+            // The last frame stays on screen until the end of the trim.
+            if (heldPts != Long.MIN_VALUE) emit(gl, st, heldPts, endUs);
+            heldPts = Long.MIN_VALUE;
             decoderDone = true;
             encoder.signalEndOfInputStream();
           }
@@ -465,6 +443,34 @@ final class VideoExporter {
         muxer.release();
       }
     }
+  }
+  private double frameStepUs;
+  private long lastSlot, lastOutUs;
+  // Writes the frame in the texture, which is on screen from source time a to b, the way the
+  // preview would show it. Without a fixed rate it keeps its own time (a frame from before
+  // the trim start that is still showing there becomes the first frame). With a fixed rate,
+  // each grid slot shows the frame that is on screen at the slot's time; a frame no slot
+  // falls on is dropped. Drawing layers show if their interval covers that time (or, for a
+  // frame at its own time, overlaps its time on screen).
+  private void emit(Gl gl, float[] st, long a, long b) {
+    long lo = Math.max(a, startUs), hi = Math.min(b, startUs + durationUs);
+    if (hi <= lo) return;
+    long outUs, spanUs;
+    if (frameStepUs > 0) {
+      double step = frameStepUs * speed; // one slot, in source time
+      long slot = Math.max(lastSlot + 1, (long) Math.ceil((lo - startUs) / step - 1e-6));
+      if (startUs + slot * step >= hi) return;
+      lastSlot = slot;
+      outUs = Math.round(slot * frameStepUs);
+      spanUs = 1;
+    } else {
+      outUs = Math.round((lo - startUs) / speed);
+      if (outUs <= lastOutUs) return;
+      spanUs = Math.max(1, Math.round((hi - lo) / speed));
+    }
+    lastOutUs = outUs;
+    gl.draw(st, outUs, spanUs);
+    gl.present(outUs * 1000);
   }
   static boolean isHdr(MediaFormat f) {
     if (!f.containsKey(MediaFormat.KEY_COLOR_TRANSFER)) return false;

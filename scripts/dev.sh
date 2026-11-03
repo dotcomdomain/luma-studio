@@ -27,7 +27,8 @@ forward() {
 launch() {
   id=$(ssh phone "$VD id")
   # The real app only enables WebView DevTools while this root-made flag file exists.
-  ssh phone "su -c 'am force-stop $PKG; [ -d /data/user/0/$PKG/files ] && touch /data/user/0/$PKG/files/devtools; am start --display $id -n $PKG/studio.luma.MainActivity >/dev/null'"
+  # (su -mm: root's default mount namespace hides the app's data dir.)
+  ssh phone "su -mm -c '[ -d /data/user/0/$PKG/files ] && touch /data/user/0/$PKG/files/devtools'; su -c 'am force-stop $PKG; am start --display $id -n $PKG/studio.luma.MainActivity >/dev/null'"
   forward
 }
 case "$1" in
@@ -49,6 +50,6 @@ case "$1" in
   eval)
     LUMA_PORT=$PORT node --experimental-websocket --no-warnings "$here/eval.mjs" "$2" ;;
   stop)
-    ssh phone "$VD stop; su -c 'rm -f /data/user/0/$PKG/files/devtools'" ;;
+    ssh phone "$VD stop; su -mm -c 'rm -f /data/user/0/$PKG/files/devtools'" ;;
   *) echo "unknown command $1" >&2; exit 2 ;;
 esac

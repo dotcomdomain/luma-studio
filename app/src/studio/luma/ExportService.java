@@ -29,11 +29,15 @@ public class ExportService extends Service {
   static void stop(Context c) {
     c.stopService(new Intent(c, ExportService.class));
   }
-  // Updated every few percent; the notification needn't follow every step.
+  // Updated at most once a second (Android drops faster updates) and only when the
+  // percentage moved.
   static int shown = -1;
+  static long shownAt = 0;
   static void progress(Context c, int percent) {
-    if (percent / 5 == shown / 5) return;
+    long now = android.os.SystemClock.uptimeMillis();
+    if (percent == shown || now - shownAt < 1000) return;
     shown = percent;
+    shownAt = now;
     try {
       c.getSystemService(NotificationManager.class).notify(ID, notification(c, percent));
     } catch (Exception ignored) {
@@ -61,6 +65,7 @@ public class ExportService extends Service {
   @Override
   public int onStartCommand(Intent intent, int flags, int startId) {
     shown = -1;
+    shownAt = android.os.SystemClock.uptimeMillis();
     startForeground(ID, notification(this, -1), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
     if (lock == null) {
       lock = getSystemService(PowerManager.class)

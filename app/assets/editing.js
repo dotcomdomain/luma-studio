@@ -52,7 +52,53 @@ function allTexts(s = state) {
   }] :
                   [];
 }
+const finiteOr = (v, fallback) => v !== null && v !== '' && Number.isFinite(+v) ? +v : fallback;
+// Saved projects come from storage and may be from an older version or damaged; every
+// value the editor relies on is checked here.
+function sanitizeState() {
+  const d = defaults();
+  for (const key of ['brightness', 'contrast', 'saturation', 'warmth'])
+    state[key] = clamp(finiteOr(state[key], 0), -100, 100);
+  state.vignette = clamp(finiteOr(state.vignette, 0), 0, 100);
+  if (!looks.some(l => l[0] === state.look)) state.look = d.look;
+  state.rotation = ((Math.round(finiteOr(state.rotation, 0) / 90) * 90) % 360 + 360) % 360;
+  state.ratio = Math.max(0, finiteOr(state.ratio, 0));
+  const c = state.crop;
+  state.crop = c && typeof c === 'object' && ['x', 'y', 'w', 'h'].every(k => Number.isFinite(c[k])) &&
+      c.w > 0 && c.h > 0 ? boundedRect(c) : null;
+  state.flip = !!state.flip;
+  state.flipY = !!state.flipY;
+  state.speed = clamp(finiteOr(state.speed, 1), .5, 2);
+  state.volume = clamp(finiteOr(state.volume, 1), 0, 1);
+  state.mute = !!state.mute;
+  if (!['pen', 'marker', 'eraser'].includes(state.brushMode)) state.brushMode = d.brushMode;
+  state.brushSize = clamp(finiteOr(state.brushSize, d.brushSize), .2, 8);
+  state.brushOpacity = clamp(finiteOr(state.brushOpacity, d.brushOpacity), .1, 1);
+  if (typeof state.brushColor !== 'string') state.brushColor = d.brushColor;
+  if (!state.brushConfigs || typeof state.brushConfigs !== 'object') state.brushConfigs = {};
+  const point = p => p && Number.isFinite(p.x) && Number.isFinite(p.y);
+  state.strokes = (Array.isArray(state.strokes) ? state.strokes : []).filter(stroke =>
+      stroke && Array.isArray(stroke.points) && stroke.points.length && stroke.points.every(point));
+  for (const stroke of state.strokes) {
+    stroke.width = finiteOr(stroke.width, .8);
+    stroke.opacity = clamp(finiteOr(stroke.opacity, 1), 0, 1);
+  }
+  state.drawingLayers = (Array.isArray(state.drawingLayers) ? state.drawingLayers : [])
+      .filter(l => l && typeof l.id === 'string');
+  if (!Array.isArray(state.texts)) state.texts = [];
+  state.texts = state.texts.filter(t => t && typeof t === 'object');
+  for (const t of state.texts) {
+    t.text = typeof t.text === 'string' ? t.text : '';
+    if (typeof t.id !== 'string') t.id = 'text-' + Date.now() + '-' + (++nextLayer);
+    t.x = finiteOr(t.x, .5);
+    t.y = finiteOr(t.y, .5);
+    t.size = finiteOr(t.size, 7);
+    t.rotation = finiteOr(t.rotation, 0);
+    t.opacity = clamp(finiteOr(t.opacity, 1), .1, 1);
+  }
+}
 function normalizeEdits() {
+  sanitizeState();
   rememberBrushConfig();
   state.strokes ||= [];
   state.drawingLayers ||= [];
@@ -215,7 +261,7 @@ function zoomFrame(value) {
 }
 function frameControls() {
   let r = cropRect();
-  return '<div class="chips">' +
+  return '<div class="chips" role="group" aria-label="Aspect ratio">' +
       chip('Free', !state.ratio && !!state.crop, 'framePreset(\'free\')') +
       [
         [0, 'Original'], [1, '1:1'], [4 / 5, '4:5'], [9 / 16, '9:16'],
@@ -227,11 +273,11 @@ function frameControls() {
                   `framePreset(${v})`))
           .join('') +
       '</div>' +
-      '<div class="frame-mode-row">' +
-      chip('Crop', frameMode === 'crop', 'selectFrameMode(\'crop\')') +
-      chip('Position', frameMode === 'position',
-           'selectFrameMode(\'position\')') +
-      '<button class="reset" onclick="resetFrame()">Reset frame</button></div>' +
+      '<div class="frame-mode-row"><div class="segmented" role="group" aria-label="What dragging does">' +
+      [['crop', 'Crop edges'], ['position', 'Move picture']].map(([mode, label]) =>
+          `<button class="segment ${frameMode === mode ? 'selected' : ''}" aria-pressed="${
+              frameMode === mode}" onclick="selectFrameMode('${mode}')">${label}</button>`).join('') +
+      '</div><button class="reset" onclick="resetFrame()">Reset frame</button></div>' +
       `<div class="slider-row"><label for="frameZoom">Zoom</label><input id="frameZoom" aria-label="Frame zoom" type="range" min="1" max="8" step=".05" value="${
              zoomAmount()}" onpointerdown="commit()" onkeydown="if(!event.repeat)commit()" oninput="zoomFrame(+this.value)"><output id="frameZoomValue">${
              zoomAmount().toFixed(1)}×</output></div>` +
@@ -397,9 +443,9 @@ function brushMode(mode) {
   persist();
   renderTool();
 }
+// Restores the current tool's width and opacity; the chosen color stays.
 function resetBrushConfig() {
-  commit();
-  applyBrushConfig(brushDefaults(state.brushMode));
+  applyBrushConfig({...brushDefaults(state.brushMode), color: state.brushColor});
   rememberBrushConfig();
   persist();
   renderTool();
@@ -453,18 +499,19 @@ function clearDrawing() {
   draw();
 }
 function drawingLayerControls() {
-  return '<div class="layer-row drawing-layer-row"><div class="chips">' +
+  if (!state.drawingLayers.length)
+    return '<p class="layer-hint">Draw on the picture to start a layer</p>';
+  const n = state.drawingLayers.findIndex(l => l.id === state.activeDrawingId) + 1;
+  return '<div class="layer-row drawing-layer-row"><div class="chips" role="group" aria-label="Drawing layers">' +
       state.drawingLayers.map((l, i) => chip('Drawing ' + (i + 1),
           l.id === state.activeDrawingId, `selectDrawing('${l.id}')`)).join('') +
-      '</div><button class="reset layer-clear" aria-label="Clear selected drawing" onclick="clearDrawing()" ' +
+      `</div><button class="reset layer-clear" aria-label="Erase all strokes in drawing ${n}" onclick="clearDrawing()" ` +
       (!selectedDrawing() ? 'disabled' : '') + '>Clear</button>' +
       '<button class="secondary" onclick="addDrawingLayer()" aria-label="Add drawing layer">' +
-      icon('plus') + '</button><button class="icon-btn" onclick="deleteDrawingLayer()" aria-label="Delete selected drawing" ' +
+      icon('plus') + `</button><button class="icon-btn" onclick="deleteDrawingLayer()" aria-label="Remove layer drawing ${n}" ` +
       (!selectedDrawing() ? 'disabled' : '') + '>' + icon('trash') + '</button></div>';
 }
 function penControls() {
-  if (!state.drawingLayers.length)
-    return '<button class="secondary add-layer-button" onclick="addDrawingLayer()" aria-label="Add drawing layer">' + icon('plus') + 'Add layer</button>';
   return drawingLayerControls() + '<div class="brush-row">' +
       colorButton('brush', state.brushColor, 'Drawing color',
                   state.brushMode === 'eraser') + '<div class="chips">' +
@@ -472,7 +519,7 @@ function penControls() {
           .map(([v, n]) => chip(n, state.brushMode === v, `brushMode('${v}')`))
           .join('') +
       '</div><button class="icon-btn brush-reset" onclick="resetBrushConfig()" aria-label="Reset ' +
-      state.brushMode + ' settings" title="Reset ' + state.brushMode + ' settings">' + icon('reset') + '</button></div>' +
+      state.brushMode + ' width and opacity" title="Reset ' + state.brushMode + ' width and opacity">' + icon('reset') + '</button></div>' +
       slider('brushSize', 'Width', .2, 8, .1) +
       (state.brushMode === 'eraser' ? '' : slider('brushOpacity', 'Opacity', .1, 1, .05)) +
       drawingTimingControls();
@@ -535,10 +582,7 @@ function renderStrokeLayer(c, s, id) {
     renderStrokeLayerDirect(c, s, id);
     return;
   }
-  if (!s.strokes?.length) {
-    previewInkCache = null;
-    return;
-  }
+  if (!s.strokes?.length) return;
   const r = cropRect(s), g = geometry(s), longest = Math.max(g.w, g.h),
         wanted = Math.min(
             2048, longest,
@@ -558,9 +602,28 @@ function renderStrokeLayer(c, s, id) {
   }
   const cached = previewInkCache, iw = cached.width, ih = cached.height;
   if (cached.list !== s.strokes || cached.revision !== inkRevision(id)) {
-    const p = cached.canvas.getContext('2d');
-    p.clearRect(0, 0, iw, ih);
-    paintInkPaths(p, s.strokes, v => v.x * iw, v => v.y * ih, iw / 100);
+    const p = cached.canvas.getContext('2d'), px = v => v.x * iw, py = v => v.y * ih;
+    const live = gesture?.kind === 'draw' && s.strokes.at(-1) === gesture.stroke ? gesture.stroke : null;
+    if (live) {
+      // The layer's other strokes are painted once into a base picture when the stroke
+      // starts; each move then repaints just the stroke being drawn, on top of it.
+      if (cached.baseFor !== live || cached.base?.width !== iw || cached.base?.height !== ih) {
+        cached.base ||= document.createElement('canvas');
+        cached.base.width = iw;
+        cached.base.height = ih;
+        paintInkPaths(cached.base.getContext('2d'), s.strokes.slice(0, -1), px, py, iw / 100);
+        cached.baseFor = live;
+      }
+      p.globalCompositeOperation = 'copy';
+      p.globalAlpha = 1;
+      p.drawImage(cached.base, 0, 0);
+      paintInkPaths(p, [live], px, py, iw / 100);
+    } else {
+      p.clearRect(0, 0, iw, ih);
+      paintInkPaths(p, s.strokes, px, py, iw / 100);
+      if (cached.base) cached.base.width = cached.base.height = 0;
+      cached.base = cached.baseFor = null;
+    }
     cached.list = s.strokes;
     cached.revision = inkRevision(id);
   }
@@ -587,34 +650,8 @@ function renderStrokeLayerDirect(c, s, id) {
     const layer = document.createElement('canvas');
     layer.width = w;
     layer.height = h;
-    const p = layer.getContext('2d');
-    p.lineCap = 'round';
-    p.lineJoin = 'round';
-    const px = v => (v.x * g.w - g.x) * sx, py = v => (v.y * g.h - g.y) * sy;
-    for (const stroke of s.strokes) {
-      let pts = stroke.points;
-      if (!pts?.length) continue;
-      p.globalCompositeOperation =
-          stroke.mode === 'eraser' ? 'destination-out' : 'source-over';
-      p.globalAlpha = stroke.mode === 'eraser' ? 1 : stroke.opacity;
-      p.strokeStyle = stroke.color;
-      p.fillStyle = stroke.color;
-      p.lineWidth = g.w * sx * stroke.width / 100;
-      if (pts.length === 1) {
-        p.beginPath();
-        p.arc(px(pts[0]), py(pts[0]), p.lineWidth / 2, 0, Math.PI * 2);
-        p.fill();
-        continue;
-      }
-      p.beginPath();
-      p.moveTo(px(pts[0]), py(pts[0]));
-      for (let i = 1; i < pts.length - 1; i++)
-        p.quadraticCurveTo(
-            px(pts[i]), py(pts[i]), (px(pts[i]) + px(pts[i + 1])) / 2,
-            (py(pts[i]) + py(pts[i + 1])) / 2);
-      p.lineTo(px(pts.at(-1)), py(pts.at(-1)));
-      p.stroke();
-    }
+    paintInkPaths(layer.getContext('2d'), s.strokes, v => (v.x * g.w - g.x) * sx,
+        v => (v.y * g.h - g.y) * sy, g.w * sx / 100);
     strokeCache =
         {canvas: layer, list: s.strokes, revision: inkRevision(id), w, h, space};
   }
@@ -704,19 +741,14 @@ let previewLayoutVersion = 0, layerRectKey = '', layerRect = null;
 function syncInteraction() {
   const layer = $('gestureLayer');
   const hint = $('gestureHint');
-  const key = tool + (tool === 'crop' ? frameMode : '');
-  const help = tool === 'crop' ?
-      (frameMode === 'crop' ? 'Drag handles to crop' :
-                              'Drag or pinch to position') :
-      tool === 'text' ? 'Drag text to move' :
-                        '';
-  hint.textContent = gestureHintsSeen[key] ? '' : help;
-  hint.classList.toggle('hidden', !hint.textContent || comparing);
+  const [key, help] = currentHint();
+  const text = gestureHintsSeen[key] ? '' : help;
+  if (hint.textContent !== text) hint.textContent = text;
+  hint.classList.toggle('hidden', !text || comparing);
   if (!layer || !state) return;
-  const interactive = ['crop', 'text', 'draw'].includes(tool) && !comparing &&
-      (tool !== 'draw' || !!selectedDrawing());
+  const interactive = ['crop', 'text', 'draw'].includes(tool) && !comparing;
   layer.classList.toggle('interactive', interactive);
-  layer.dataset.tool = tool;
+  if (layer.dataset.tool !== tool) layer.dataset.tool = tool;
   const cropUI = $('cropOverlay'), selection = $('textSelection');
   const showCrop = tool === 'crop' && frameMode === 'crop' && !comparing;
   const bound = tool === 'text' && !comparing && textBounds.find(t => t.id === state.activeTextId);
@@ -757,6 +789,23 @@ function syncInteraction() {
     $('frameZoomValue').value = zoomAmount().toFixed(1) + '×';
   }
 }
+// One short hint per gesture, shown until it has been used once.
+function currentHint() {
+  if (tool === 'crop')
+    return frameMode === 'crop' ? ['cropcrop', 'Drag the handles to crop'] :
+        ['cropposition', 'Drag or pinch to move the picture'];
+  if (tool === 'text') return ['text', 'Drag text to move it'];
+  if (tool === 'draw') return ['draw', 'Draw on the picture'];
+  if (mediaType !== 'video') return ['', ''];
+  if (tool === 'trim') return ['trim', 'Hold a handle still to zoom in'];
+  return ['play', 'Tap the picture to play'];
+}
+function markHintSeen(key) {
+  if (!key || gestureHintsSeen[key]) return;
+  gestureHintsSeen[key] = true;
+  storeSetting('gesture-hints', JSON.stringify(gestureHintsSeen));
+  syncInteraction();
+}
 function framePointToSource(p) {
   const r = cropRect();
   return {x: r.x + p.x * r.w, y: r.y + p.y * r.h};
@@ -781,8 +830,7 @@ function hitText(point) {
 }
 const surface = $('gestureLayer');
 surface.addEventListener('pointerdown', e => {
-  if (exporting || !['crop', 'text', 'draw'].includes(tool) ||
-      (tool === 'draw' && !selectedDrawing())) return;
+  if (exporting || !['crop', 'text', 'draw'].includes(tool)) return;
   e.preventDefault();
   surface.setPointerCapture(e.pointerId);
   activePointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
@@ -814,8 +862,9 @@ surface.addEventListener('pointerdown', e => {
   if (tool === 'text') {
     let id = hitText(point);
     if (!id) return;
-    commit();
+    // Selecting a layer isn't an edit; only moving it is.
     state.activeTextId = id;
+    commit();
     const text = selectedText();
     gesture = {
       kind: 'text',
@@ -835,7 +884,8 @@ surface.addEventListener('pointerdown', e => {
   if (tool === 'draw') {
     ensureDrawingPreviewTime();
     commit();
-    const layer = selectedDrawing();
+    // The first stroke on a picture with no drawing layer starts one.
+    const layer = selectedDrawing() || addDrawingLayer(false);
     point = framePointToSource(point);
     let stroke = {
       layerId: layer.id,
@@ -860,20 +910,26 @@ surface.addEventListener('pointermove', e => {
     const p = [...activePointers.values()],
           distance = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y),
           scale = clamp(distance / Math.max(1, g.distance), .1, 10),
-          maxBase = Math.min(1 / g.r.w, 1 / g.r.h);
-    const factor =
-              clamp(1 / scale, Math.max(.02 / g.r.w, .02 / g.r.h), maxBase),
-          w = g.r.w * factor, h = g.r.h * factor;
-    const dx = ((p[0].x + p[1].x) / 2 - g.mid.x) / g.bounds.width *
-        (frameMode === 'crop' ? 1 : g.r.w),
-          dy = ((p[0].y + p[1].y) / 2 - g.mid.y) / g.bounds.height *
-        (frameMode === 'crop' ? 1 : g.r.h);
-    state.crop = boundedRect({
-      x: g.r.x + (g.r.w - w) / 2 - dx,
-      y: g.r.y + (g.r.h - h) / 2 - dy,
-      w,
-      h
-    });
+          maxBase = Math.min(1 / g.r.w, 1 / g.r.h),
+          mid = {x: (p[0].x + p[1].x) / 2, y: (p[0].y + p[1].y) / 2};
+    if (frameMode === 'crop') {
+      // The whole picture is shown with the crop box on it: spreading the fingers grows
+      // the box and moving them moves the box with them.
+      const factor = clamp(scale, Math.max(.02 / g.r.w, .02 / g.r.h), maxBase),
+            w = g.r.w * factor, h = g.r.h * factor,
+            dx = (mid.x - g.mid.x) / g.bounds.width, dy = (mid.y - g.mid.y) / g.bounds.height;
+      state.crop = boundedRect({x: g.r.x + (g.r.w - w) / 2 + dx, y: g.r.y + (g.r.h - h) / 2 + dy, w, h});
+    } else {
+      // The crop fills the preview: spreading zooms in on the point between the fingers,
+      // which stays under them while they move.
+      const factor = clamp(1 / scale, Math.max(.02 / g.r.w, .02 / g.r.h), maxBase),
+            w = g.r.w * factor, h = g.r.h * factor,
+            ax = clamp((g.mid.x - g.bounds.left) / g.bounds.width, 0, 1),
+            ay = clamp((g.mid.y - g.bounds.top) / g.bounds.height, 0, 1),
+            bx = clamp((mid.x - g.bounds.left) / g.bounds.width, 0, 1),
+            by = clamp((mid.y - g.bounds.top) / g.bounds.height, 0, 1);
+      state.crop = boundedRect({x: g.r.x + ax * g.r.w - bx * w, y: g.r.y + ay * g.r.h - by * h, w, h});
+    }
     draw();
     return;
   }
@@ -943,11 +999,14 @@ surface.addEventListener('pointermove', e => {
   }
   draw();
 });
+// Stroke points are fractions of the picture; four decimals is finer than a pixel of a
+// 10 000 px image and keeps saved projects and undo steps small.
+const roundPoint = p => ({x: Math.round(p.x * 1e4) / 1e4, y: Math.round(p.y * 1e4) / 1e4});
 function endGesture(e) {
-  if (gesture) {
-    gestureHintsSeen[tool + (tool === 'crop' ? frameMode : '')] = true;
-    try { localStorage.setItem('gesture-hints', JSON.stringify(gestureHintsSeen)); }
-    catch (_) {}
+  if (gesture) markHintSeen(currentHint()[0]);
+  if (gesture?.kind === 'draw' && gesture.pointer === e.pointerId) {
+    gesture.stroke.points = gesture.stroke.points.map(roundPoint);
+    layerRevisions.set(gesture.stroke.layerId, (layerRevisions.get(gesture.stroke.layerId) || 0) + 1);
   }
   activePointers.delete(e.pointerId);
   if (gesture?.kind === 'pinch') {

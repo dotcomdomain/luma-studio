@@ -474,6 +474,14 @@ public class MainActivity extends Activity {
     lastExport = uri;
     return uri;
   }
+  // Codec errors usually carry no message; say which part failed instead of nothing.
+  static String describe(Throwable e) {
+    if (e.getMessage() != null && !e.getMessage().trim().isEmpty()) return e.getMessage();
+    if (e instanceof android.media.MediaCodec.CodecException || e instanceof IllegalStateException)
+      return "The phone's video decoder or encoder stopped with an error. The file may be "
+          + "larger or more unusual than it can handle.";
+    return e.getClass().getSimpleName();
+  }
   // Turns an exception into something a person can act on, keeping the detail.
   static String friendly(String detail) {
     String d = detail == null ? "" : detail.trim();
@@ -696,7 +704,7 @@ public class MainActivity extends Activity {
           // reported in finally
         } catch (Throwable e) {
           if (!cancelled || publishing)
-            fail("Video export failed. " + friendly(e.getMessage()));
+            fail("Video export failed. " + friendly(describe(e)));
         } finally {
           out.delete();
           exportBusy = false;
