@@ -1,7 +1,3 @@
-const gestureHintsSeen = (() => {
-  try { return JSON.parse(localStorage.getItem('gesture-hints') || '{}') || {}; }
-  catch (_) { return {}; }
-})();
 const toolDropdowns = new Map();
 let focusNewText = false;
 let textStyleOpen = false, gesture = null;
@@ -778,11 +774,6 @@ function paintAnnotations(c, s) {
 let previewLayoutVersion = 0, layerRectKey = '', layerRect = null;
 function syncInteraction() {
   const layer = $('gestureLayer');
-  const hint = $('gestureHint');
-  const [key, help] = currentHint();
-  const text = gestureHintsSeen[key] ? '' : help;
-  if (hint.textContent !== text) hint.textContent = text;
-  hint.classList.toggle('hidden', !text || comparing);
   if (!layer || !state) return;
   const interactive = ['crop', 'text', 'draw'].includes(tool) && !comparing;
   layer.classList.toggle('interactive', interactive);
@@ -827,22 +818,6 @@ function syncInteraction() {
     $('frameZoom').value = zoomAmount();
     $('frameZoomValue').value = zoomAmount().toFixed(1) + '×';
   }
-}
-// One short hint per gesture, shown until it has been used once.
-function currentHint() {
-  if (tool === 'crop')
-    return ['frame', 'Drag an edge to crop. Drag or pinch to move the picture'];
-  if (tool === 'text') return ['text', 'Drag text to move it'];
-  if (tool === 'draw') return ['draw', 'Draw on the picture'];
-  if (mediaType !== 'video') return ['', ''];
-  if (tool === 'trim') return ['trim', 'Hold a handle still to zoom in'];
-  return ['play', 'Tap the picture to play'];
-}
-function markHintSeen(key) {
-  if (!key || gestureHintsSeen[key]) return;
-  gestureHintsSeen[key] = true;
-  storeSetting('gesture-hints', JSON.stringify(gestureHintsSeen));
-  syncInteraction();
 }
 function framePointToSource(p) {
   const r = cropRect();
@@ -1045,7 +1020,6 @@ surface.addEventListener('pointermove', e => {
 // 10 000 px image and keeps saved projects and undo steps small.
 const roundPoint = p => ({x: Math.round(p.x * 1e4) / 1e4, y: Math.round(p.y * 1e4) / 1e4});
 function endGesture(e) {
-  if (gesture) markHintSeen(currentHint()[0]);
   if (gesture?.kind === 'draw' && gesture.pointer === e.pointerId) {
     gesture.stroke.points = gesture.stroke.points.map(roundPoint);
     layerRevisions.set(gesture.stroke.layerId, (layerRevisions.get(gesture.stroke.layerId) || 0) + 1);

@@ -302,7 +302,6 @@ function armPrecisionHold(g, event, eligible) {
     const start = clamp(Math.round((value - value / duration * span) * 100) / 100, 0, duration - span);
     g.zoom = {start, end: start + span};
     g.target.classList.add('precision-active');
-    markHintSeen('trim');
     if (g.kind === 'scrub') {
       $('scrub').min = start;
       $('scrub').max = start + span;

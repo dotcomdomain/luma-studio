@@ -102,12 +102,10 @@ function openImported(path, type, name, external) {
     hideBusy();
     if (pendingImport) Native.forgetFile(pendingImport.path);
     pendingImport = {path, type, name, external};
-    toast(name.replace(/\.[^.]+$/, '') + ' will open when the export finishes');
     return;
   }
   const replacing = !$('editor').classList.contains('hidden') && mediaPath !== path &&
       isImportedPath(mediaPath) && history.length;
-  if (replacing) toast('Your edits to ' + mediaName.replace(/\.[^.]+$/, '') + ' are saved in Recent');
   loadMedia(path, type, name, false, external);
 }
 function openPendingImport() {
@@ -482,7 +480,6 @@ function resetEdit() {
   normalizeTimings();
   persist();
   afterHistory();
-  if (editsJSON(state) !== before) toast('All edits removed. Undo brings them back');
 }
 // A look adds its offsets to the sliders, scaled by its strength.
 function params(s) {
@@ -665,7 +662,10 @@ function renderTo(target, max, original = false, viewState = state, background =
   const cacheable = target === canvas && !background &&
       (mediaType === 'photo' || (video.paused && !video.seeking));
   const key = cacheable ? [mediaPath, tw, th, s.rotation, s.straighten, s.flip, s.flipY, g.x, g.y, g.cw, g.ch,
-    cssFilter(s), source === previewImage, mediaType === 'photo' ? 0 : video.currentTime].join('|') : '';
+    // The filter includes the video's color correction, which arrives after the first
+    // frame is drawn; without it the uncorrected first frame stayed until playback.
+    cssFilter(s, source === video ? videoColorCorrection : null), source === previewImage,
+    mediaType === 'photo' ? 0 : video.currentTime].join('|') : '';
   if (cacheable && key === previewBase.key) {
     c.drawImage(previewBase.canvas, 0, 0);
   } else {
@@ -845,7 +845,6 @@ $('preview').addEventListener('click', () => {
   const willPlay = video.paused;
   togglePlay();
   flashPlayState(willPlay);
-  markHintSeen('play');
 });
 function time(n) {
   return `${Math.floor(n / 60)}:${String(Math.floor(n % 60)).padStart(2, '0')}`
@@ -1055,10 +1054,7 @@ function goBack() {
     closeColorPicker(false);
     return true;
   }
-  if (exporting) {
-    toast(mediaType === 'photo' ? 'Saving. Please wait' : 'Finish or cancel the export first');
-    return true;
-  }
+  if (exporting) return true;
   if (!$('exportModal').classList.contains('hidden')) {
     closeExport();
     return true;
@@ -1082,8 +1078,7 @@ function showHome() {
   $('home').classList.remove('hidden');
 }
 function openExport() {
-  if (!nativeW || !nativeH) { toast('Media is still loading'); return; }
-  if (savingFrame) return;
+  if (!nativeW || !nativeH || savingFrame) return;
   cancelTimingInteraction();
   video.pause();
   $('exportOptions').style.pointerEvents = '';
@@ -1103,10 +1098,7 @@ function openExport() {
 }
 function closeExport() {
   closeExportDropdown(false);
-  if (exporting) {
-    toast('Cancel the export to close this panel');
-    return
-  }
+  if (exporting) return;
   hideExportModal();
   document.querySelector('.export-btn').focus({preventScroll: true});
 }
@@ -1259,7 +1251,12 @@ async function saveFrame() {
 function frameSaved(error = '') {
   savingFrame = false;
   $('saveFrameButton').disabled = false;
-  toast(error ? error.split('\n')[0] : `Frame at ${formatPreciseTime(video.currentTime)} saved to Pictures/Luma`);
+  // Only a failure says anything; a saved frame shows as a brief check on the button.
+  if (error) toast(error.split('\n')[0]);
+  else {
+    $('saveFrameButton').innerHTML = icon('check');
+    setTimeout(() => { $('saveFrameButton').innerHTML = icon('photo'); }, 1200);
+  }
   if (pendingImport) openPendingImport();
 }
 function exportGeometry(size = exportSize) {
@@ -1359,7 +1356,6 @@ function exportDone(note = '') {
   Native.keepScreenOn?.(false);
   if (savingFrame) { frameSaved(); return; }
   if (pendingImport) {
-    toast('Saved to gallery');
     openPendingImport();
     return;
   }
@@ -1369,9 +1365,9 @@ function exportDone(note = '') {
   $('saveButton').disabled = true;
   $('shareButton').classList.remove('hidden');
   $('cancelExport').classList.add('hidden');
-  $('exportStatus').textContent = (mediaType === 'photo' ?
-      'Saved to Pictures/Luma' :
-      'Saved to Movies/Luma') + (note ? '\n' + note : '');
+  // The button already says it's saved; only a note (a shortened clip, dropped audio)
+  // needs words.
+  $('exportStatus').textContent = note;
 }
 function exportError(message) {
   exporting = false;
@@ -1401,7 +1397,6 @@ function exportCancelled() {
   $('cancelExport').disabled = false;
   $('exportOptions').style.pointerEvents = '';
   hideExportModal();
-  toast('Export cancelled');
   openPendingImport();
 }
 document.addEventListener('visibilitychange', () => {
