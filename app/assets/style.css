@@ -396,10 +396,11 @@ input[type=range]{height:44px}
 
 /* The options scroll under the title and the Save area; instead of a shadow, they fade
    into the sheet's own color at both edges. */
-.export-sheet .sheet-top::after,.export-sheet .sheet-bottom::before{content:'';position:absolute;left:0;right:0;height:22px;pointer-events:none}
+.export-sheet .sheet-top::after,.export-sheet .sheet-bottom::before{content:'';position:absolute;left:0;right:0;height:22px;pointer-events:none;opacity:0;transition:opacity .15s}.export-sheet.fade-top .sheet-top::after,.export-sheet.fade-bottom .sheet-bottom::before{opacity:1}
 .export-sheet .sheet-top::after{top:100%;background:linear-gradient(#222e25,#222e2500)}
 .export-sheet .sheet-bottom::before{bottom:100%;background:linear-gradient(#222e2500,#222e25)}
 @media(min-width:700px){.export-sheet .sheet-top::after,.export-sheet .sheet-bottom::before{display:none}}
 .save-button .save-eta{font-weight:500;opacity:.8}
 .save-button .save-eta::before{content:'·';margin-right:10px}
 .sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+textarea,input,select,button{font-family:inherit}

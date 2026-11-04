@@ -343,7 +343,14 @@ $('exportOptions').addEventListener('keydown', event => {
 });
 window.addEventListener('resize', positionExportDropdown);
 window.visualViewport?.addEventListener('resize', positionExportDropdown);
-document.querySelector('.export-sheet').addEventListener('scroll', () => closeExportDropdown());
+// Each edge fades only while options are scrolled under it.
+function updateExportFades() {
+  const sheet = document.querySelector('.export-sheet'), max = sheet.scrollHeight - sheet.clientHeight;
+  sheet.classList.toggle('fade-top', sheet.scrollTop > 2);
+  sheet.classList.toggle('fade-bottom', sheet.scrollTop < max - 2);
+}
+document.querySelector('.export-sheet').addEventListener('scroll', () => { closeExportDropdown(); updateExportFades(); });
+new ResizeObserver(updateExportFades).observe($('exportOptions'));
 // In landscape the options scroll inside their own column.
 $('exportOptions').addEventListener('scroll', () => closeExportDropdown());
 // Opening More options near the bottom of the sheet would leave the new options out of
