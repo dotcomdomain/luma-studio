@@ -1176,7 +1176,8 @@ async function doExport() {
   $('cancelExport').disabled = false;
   $('saveButton').disabled = true;
   $('saveButton').textContent = 'Preparing…';
-  $('exportStatus').textContent = 'Saving…';
+  $('exportStatus').textContent = '';
+  $('exportAnnounce').textContent = '';
   $('exportOptions').style.pointerEvents = 'none';
   if ($('exportFields')) $('exportFields').disabled = true;
   try {
@@ -1326,28 +1327,27 @@ function videoGeometry() {
   };
 }
 let exportStartedAt = 0, exportProgressShown = -1;
+// The button shows the percentage and, once there's enough of the export to judge by,
+// the time left. Screen readers hear the time through a hidden status, in 10% steps.
 function exportProgress(n) {
-  $('saveButton').textContent = `Saving… ${n}%`;
-  $('saveButton').classList.add('save-progress');
-  $('saveButton').style.setProperty('--progress', n + '%');
-  // Time left, once there's enough of the export to judge by. Screen readers hear it
-  // through the status line, in steps of 10%.
   const elapsed = (performance.now() - exportStartedAt) / 1000;
+  let eta = '';
   if (n >= 5 && elapsed > 2) {
     const left = Math.max(1, Math.round(elapsed * (100 - n) / n));
-    const text = left < 60 ? `About ${left < 10 ? left : Math.ceil(left / 5) * 5} s left` :
-        `About ${Math.ceil(left / 60)} min left`;
+    eta = left < 60 ? `${left < 10 ? left : Math.ceil(left / 5) * 5} s left` : `${Math.ceil(left / 60)} min left`;
     if (Math.floor(n / 10) !== exportProgressShown) {
       exportProgressShown = Math.floor(n / 10);
-      $('exportStatus').textContent = text;
+      $('exportAnnounce').textContent = `${n}%, about ${eta}`;
     }
   }
+  $('saveButton').innerHTML = `<span>Saving… ${n}%</span>` + (eta ? `<span class="save-eta">${eta}</span>` : '');
+  $('saveButton').classList.add('save-progress');
+  $('saveButton').style.setProperty('--progress', n + '%');
 }
 // Once the file is being copied into the gallery, Cancel no longer applies.
 let exportFinishing = false;
 function exportFinalizing() {
   exportFinishing = true;
-  $('exportStatus').textContent = 'Saving to the gallery…';
   $('saveButton').textContent = 'Finishing…';
   $('cancelExport').classList.add('hidden');
 }
@@ -1360,7 +1360,8 @@ function exportDone(note = '') {
     return;
   }
   $('saveButton').classList.remove('save-progress');
-  $('saveButton').innerHTML = icon('check') + 'Saved to gallery';
+  $('saveButton').innerHTML = icon('check') + (mediaType === 'photo' ? 'Saved to Pictures/Luma' : 'Saved to Movies/Luma');
+  $('exportAnnounce').textContent = '';
   $('saveButton').classList.add('saved');
   $('saveButton').disabled = true;
   $('shareButton').classList.remove('hidden');
