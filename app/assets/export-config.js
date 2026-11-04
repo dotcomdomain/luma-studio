@@ -2,7 +2,7 @@ let exportConfig = exportDefaults(), exportAdvancedOpen = false, exportDropdown 
 const exportDropdowns = new Map(), exportHelpOpen = new Set();
 let exportPhotoFormatExplicit = false, pendingPhotoTransparencyRefresh = false;
 function exportDefaults() {
-  return {preset: 'balanced', codec: 'h264', crf: 23, fps: 0, fpsCap30: false,
+  return {preset: 'quality', codec: 'h264', crf: 20, fps: 0, fpsCap30: false,
     rateMode: 'quality', bitrate: 8, bitrateAutomatic: true,
     preferredPhotoFormat: null,
     audioBitrate: 192, channels: 0, sampleRate: 0, name: ''};
@@ -19,9 +19,14 @@ function initializeExportSettings() {
   exportPhotoFormatExplicit = false;
   exportFormat = mediaType === 'photo' ? 'jpg' : 'mp4';
   exportSize = 0;
-  quality = .9;
+  quality = .95;
   try {
-    const saved = JSON.parse(readSetting('export-settings:' + mediaType) || '{}');
+    // Settings saved before High quality became the default (schema 3) keep only the
+    // codec and photo format; the rest starts from the new default.
+    const stored = JSON.parse(readSetting('export-settings:' + mediaType) || '{}') || {},
+          saved = stored.schema >= 3 ? stored :
+              {codec: stored.codec, schema: 2,
+               preferredPhotoFormat: stored.schema >= 2 ? stored.preferredPhotoFormat : stored.format};
     for (const [key, options] of Object.entries(exportEnums))
       if (options.includes(saved[key])) exportConfig[key] = saved[key];
     if (['quality', 'balanced', 'small', 'custom'].includes(saved.preset)) exportConfig.preset = saved.preset;
@@ -96,7 +101,7 @@ function useSuggestedBitrate() {
 function saveExportPreferences() {
   const {name, ...config} = exportConfig;
   storeSetting('export-settings:' + mediaType,
-      JSON.stringify({...config, schema: 2, size: exportSize, sizePath: mediaPath, quality}));
+      JSON.stringify({...config, schema: 3, size: exportSize, sizePath: mediaPath, quality}));
 }
 function setExportPreset(preset) {
   if (exporting || !['quality', 'balanced', 'small'].includes(preset)) return;
@@ -144,7 +149,8 @@ function setExportOption(key, value) {
     exportConfig[key] = value;
     if (key === 'fps') exportConfig.fpsCap30 = false;
   }
-  exportConfig.preset = 'custom';
+  // Presets leave the format and codec alone, so choosing one isn't a custom setting.
+  if (key !== 'format' && key !== 'codec') exportConfig.preset = 'custom';
   refreshSuggestedBitrate();
   saveExportPreferences();
   renderExport();
@@ -374,9 +380,15 @@ function renderExport() {
       [[18, 'Highest'], [20, 'High'], [23, 'Standard'], [28, 'Compact']], 'crf', {topic:'quality', title:'About video quality', text:'Highest is the least compressed option here, not lossless. Higher quality generally makes larger files.'});
   if (!photo) content += exportSelect('exportFps', 'Frame rate', exportConfig.fps,
       [[0, 'Original'], ...[24,25,30,50,60].map(n => [n, n + ' fps'])], 'fps');
-  content += `<details class="export-advanced" ${exportAdvancedOpen ? 'open' : ''} ontoggle="if(this.open&&!exportAdvancedOpen)revealExportAdvanced(this);exportAdvancedOpen=this.open"><summary><span>More options</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></summary><div class="export-advanced-body">`;
-  if (photo && exportFormat !== 'png') content += `<div class="export-quality"><div><div class="export-quality-label"><label for="exportQuality">Compression quality</label>${exportHelpButton('quality', 'About compression quality')}</div><output id="exportQualityValue">${Math.round(quality * 100)}%</output></div><input id="exportQuality" type="range" min="50" max="100" value="${Math.round(quality * 100)}" oninput="setPhotoExportQuality(this.value)">${exportHelpPanel('quality', 'JPEG and WebP are lossy, even at 100%. Choose PNG for lossless output.')}</div>`;
-  content += `<div class="export-name"><label for="exportName">File name</label><div><input id="exportName" class="field" type="text" maxlength="64" placeholder="Automatic" value="${exportEscape(exportConfig.name)}" oninput="exportConfig.name=this.value"><span>.${exportFormat}</span></div></div>`;
+  // Photos have two settings past format and size, so they show directly. Videos keep
+  // theirs under More options.
+  if (photo) {
+    if (exportFormat !== 'png') content += `<div class="export-quality"><div><div class="export-quality-label"><label for="exportQuality">Compression quality</label>${exportHelpButton('quality', 'About compression quality')}</div><output id="exportQualityValue">${Math.round(quality * 100)}%</output></div><input id="exportQuality" type="range" min="50" max="100" value="${Math.round(quality * 100)}" oninput="setPhotoExportQuality(this.value)">${exportHelpPanel('quality', 'JPEG and WebP are lossy, even at 100%. Choose PNG for lossless output.')}</div>`;
+    content += `<div class="export-name"><label for="exportName">File name</label><div><input id="exportName" class="field" type="text" maxlength="64" placeholder="Automatic" value="${exportEscape(exportConfig.name)}" oninput="exportConfig.name=this.value"><span>.${exportFormat}</span></div></div>`;
+  } else {
+    content += `<details class="export-advanced" ${exportAdvancedOpen ? 'open' : ''} ontoggle="if(this.open&&!exportAdvancedOpen)revealExportAdvanced(this);exportAdvancedOpen=this.open"><summary><span>More options</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></summary><div class="export-advanced-body">`;
+    content += `<div class="export-name"><label for="exportName">File name</label><div><input id="exportName" class="field" type="text" maxlength="64" placeholder="Automatic" value="${exportEscape(exportConfig.name)}" oninput="exportConfig.name=this.value"><span>.${exportFormat}</span></div></div>`;
+  }
   if (!photo) {
     if (videoEncoders().hevc)
       content += exportSelect('exportCodec', 'Codec', exportConfig.codec, [['h264', 'H.264 · 8-bit'], ['hevc', 'HEVC / H.265 · 8-bit', 'HEVC · 8-bit']], 'codec', {topic:'codec', title:'About codecs and video color', text:'H.264 plays almost everywhere. HEVC makes smaller files at the same quality, but some older players can\'t open it. Both export 8-bit SDR video with the phone\'s hardware encoder.'});
@@ -389,9 +401,8 @@ function renderExport() {
       content += exportSelect('exportSampleRate', 'Sample rate', exportConfig.sampleRate, [[0, 'Original'], [44100, '44.1 kHz'], [48000, '48 kHz']], 'sampleRate');
     }
   }
-  content += '</div></details></fieldset>';
-  if (!photo) content += `<button id="saveFrameButton" type="button" class="secondary save-frame" onclick="saveFrame()">${
-      icon('photo')}Save the frame at ${formatPreciseTime(video.currentTime)} as a photo</button>`;
+  if (!photo) content += '</div></details>';
+  content += '</fieldset>';
   $('exportOptions').innerHTML = content;
   if (exporting) $('exportFields').disabled = true;
   updateExportSummary();

@@ -1083,6 +1083,7 @@ function showHome() {
 }
 function openExport() {
   if (!nativeW || !nativeH) { toast('Media is still loading'); return; }
+  if (savingFrame) return;
   cancelTimingInteraction();
   video.pause();
   $('exportOptions').style.pointerEvents = '';
@@ -1234,13 +1235,14 @@ async function doExport() {
 }
 // Saves the video frame under the playhead, with all its edits, as a JPEG photo.
 let savingFrame = false;
+// The photo button beside Export saves the frame on screen, with every edit, as a
+// full-resolution JPEG.
 async function saveFrame() {
   if (exporting || mediaType !== 'video') return;
-  closeExportDropdown(false);
+  video.pause();
   exporting = savingFrame = true;
   Native.keepScreenOn?.(true);
-  $('saveFrameButton').disabled = $('saveButton').disabled = true;
-  $('exportStatus').textContent = 'Saving the frame…';
+  $('saveFrameButton').disabled = true;
   try {
     const output = document.createElement('canvas');
     renderTo(output, Math.max(nativeW, nativeH), false, state);
@@ -1249,17 +1251,15 @@ async function saveFrame() {
     directInkCaches.clear();
     if (!blob) throw new Error('The frame could not be encoded');
     await sendPhoto(blob);
-    const base = exportConfig.name.trim();
-    Native.photoFinish('jpg', base ? base + ' frame' : '');
+    Native.photoFinish('jpg', '');
   } catch (e) {
     exportError('Could not save the frame. ' + e.message);
   }
 }
 function frameSaved(error = '') {
   savingFrame = false;
-  $('saveFrameButton').disabled = $('saveButton').disabled = false;
-  $('exportStatus').textContent = error || 'Frame saved to Pictures/Luma';
-  if (!error) $('shareButton').classList.remove('hidden');
+  $('saveFrameButton').disabled = false;
+  toast(error ? error.split('\n')[0] : `Frame at ${formatPreciseTime(video.currentTime)} saved to Pictures/Luma`);
   if (pendingImport) openPendingImport();
 }
 function exportGeometry(size = exportSize) {

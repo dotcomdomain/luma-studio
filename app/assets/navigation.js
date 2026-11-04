@@ -9,6 +9,7 @@ function configureNavigation(type) {
     button.style.order = index;
   });
   document.querySelector('.tool-nav').scrollLeft = 0;
+  $('saveFrameButton').classList.toggle('hidden', type !== 'video');
   updateNavigation();
   requestAnimationFrame(updateNavigationFade);
 }
