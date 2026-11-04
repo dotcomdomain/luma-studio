@@ -1252,12 +1252,8 @@ async function saveFrame() {
 function frameSaved(error = '') {
   savingFrame = false;
   $('saveFrameButton').disabled = false;
-  // Only a failure says anything; a saved frame shows as a brief check on the button.
-  if (error) toast(error.split('\n')[0]);
-  else {
-    $('saveFrameButton').innerHTML = icon('check');
-    setTimeout(() => { $('saveFrameButton').innerHTML = icon('photo'); }, 1200);
-  }
+  // The one success that gets a toast: nothing else on screen shows a frame was saved.
+  toast(error ? error.split('\n')[0] : `Frame at ${formatPreciseTime(video.currentTime)} saved to Pictures/Luma`);
   if (pendingImport) openPendingImport();
 }
 function exportGeometry(size = exportSize) {
